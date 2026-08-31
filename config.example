@@ -1,0 +1,52 @@
+# mail2 邮箱配置示例
+# 支持两种形态：
+#   1) 结构化 YAML（本文件，config.yaml）
+#   2) 邮箱服务商导出的文本（config）——自动识别，无需改格式
+# 启动时优先读取 config.yaml，其次读取 config。
+
+# HTTP 服务监听地址（Web 控制台 + REST API）
+listen: "127.0.0.1:8080"
+
+# API 鉴权 token；为空则不鉴权（仅建议本机使用）
+auth_token: ""
+
+# 数据目录（SQLite 数据库位置）
+data_dir: "./data"
+
+# 时区（影响 DDL 计算与每日检查时刻）；留空 = 系统本地时区
+timezone: "Asia/Shanghai"
+
+# IMAP 拉取间隔（秒）
+poll_interval_secs: 60
+
+# 提醒设置
+reminder:
+  # 提醒目标邮箱；留空 = 使用 mail.address（即发给自己）
+  to: ""
+  # 截止前 N 天发送提醒
+  days_before: 1
+  # 提醒当天几点发送（"HH:MM"，按 timezone）
+  lead_time: "09:00"
+  # 可选：App 推送 webhook（POST JSON {title, content}，如 server酱/企业微信机器人），留空不启用
+  webhook_url: ""
+
+# 每日定时检查时刻（检查待办完成情况、漏发/发送失败并重试）
+check_times: ["06:00", "12:30", "18:30", "00:00"]
+
+# 邮箱账号（首次启动会迁移为数据库中的"默认账户"）
+# 运行期可在 Web「邮箱账户」页添加/编辑/删除更多邮箱（每账户独立 IMAP/SMTP/启用状态），
+# 轮询会遍历全部启用账户；此处仅作为种子配置。
+mail:
+  address: "user@example.com"
+  imap:
+    host: "imap.stu.xmu.edu.cn"
+    port: 993            # SSL 端口；143 = 明文
+    user: "user@example.com"
+    password: "your-app-password"   # 填入客户端专用密码
+    tls_insecure: true   # 校方证书为 *.icoremail.net 与域名不一致 → 跳过域名校验（加密保留）
+  smtp:
+    host: "smtp.stu.xmu.edu.cn"
+    port: 465            # SSL 端口；25/587 = 明文/STARTTLS
+    user: "user@example.com"
+    password: "your-app-password"   # 填入客户端专用密码
+    tls_insecure: true   # 同上，证书为 *.icoremail.net

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mail2 · 邮件管理控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">📬 mail2 <span class="sub">邮件管理控制台</span></div>
+  <div class="health" id="health">连接中…</div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-view="items">待办</button>
+  <button class="tab" data-view="notices">通知</button>
+  <button class="tab" data-view="emails">邮件</button>
+  <button class="tab" data-view="accounts">邮箱账户</button>
+  <button class="tab" data-view="approvals">审批</button>
+  <button class="tab" data-view="logs">发送日志</button>
+</nav>
+
+<main>
+  <!-- ===== 待办（kind=todo） ===== -->
+  <section id="view-items" class="view active">
+    <div class="toolbar">
+      <div class="filters">
+        <select id="flt-status">
+          <option value="">全部状态</option>
+          <option value="active">进行中</option>
+          <option value="expired">已过期</option>
+          <option value="completed">已完成</option>
+          <option value="silent">已静默</option>
+        </select>
+        <select id="flt-cat"><option value="">全部分类</option></select>
+        <select id="flt-party"><option value="">全部单位/联系人</option></select>
+        <input id="flt-q" type="search" placeholder="搜索待办…">
+        <button id="btn-refresh-items" class="btn">刷新</button>
+        <button id="btn-run-check" class="btn ghost">立即检查</button>
+      </div>
+      <button id="btn-new-item" class="btn primary">＋ 新建待办</button>
+    </div>
+
+    <div class="batchbar">
+      <label class="chk-all"><input type="checkbox" id="items-check-all"> 全选本页</label>
+      <span class="muted small">批量（勾选）：</span>
+      <button class="btn small" onclick="batchItems('complete',false,'items')">完成</button>
+      <button class="btn small" onclick="batchItems('silent',false,'items')">静默</button>
+      <button class="btn small" onclick="batchItems('activate',false,'items')">恢复进行中</button>
+      <button class="btn small danger" onclick="batchItems('delete',false,'items')">删除</button>
+      <span class="sep"></span>
+      <span class="muted small">或按创建时间区间：</span>
+      <input type="datetime-local" id="batch-from" class="small-input">
+      <span class="muted small">至</span>
+      <input type="datetime-local" id="batch-to" class="small-input">
+      <select id="batch-action" class="small-input">
+        <option value="complete">标记完成</option>
+        <option value="silent">标记静默</option>
+        <option value="activate">恢复进行中</option>
+        <option value="delete">删除</option>
+      </select>
+      <button class="btn small" onclick="batchItems(document.getElementById('batch-action').value,true,'items')">按区间执行</button>
+      <span id="batch-msg" class="small"></span>
+    </div>
+
+    <table class="grid" id="items-table">
+      <thead>
+        <tr>
+          <th class="col-chk"></th>
+          <th>事项</th><th>单位/联系人</th><th>分类</th>
+          <th>截止时间</th><th>提醒时刻</th><th>状态</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="items-body"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- ===== 通知（kind=notification） ===== -->
+  <section id="view-notices" class="view">
+    <div class="toolbar">
+      <div class="filters">
+        <select id="flt-notice-status">
+          <option value="">全部状态</option>
+          <option value="active">进行中</option>
+          <option value="completed">已完成</option>
+          <option value="silent">已静默</option>
+        </select>
+        <select id="flt-notice-cat"><option value="">全部分类</option></select>
+        <input id="flt-notice-q" type="search" placeholder="搜索通知…">
+        <button id="btn-refresh-notices" class="btn">刷新</button>
+      </div>
+      <button id="btn-new-notice" class="btn primary">＋ 新建通知</button>
+    </div>
+
+    <div class="batchbar">
+      <label class="chk-all"><input type="checkbox" id="notices-check-all"> 全选本页</label>
+      <span class="muted small">批量（勾选）：</span>
+      <button class="btn small" onclick="batchItems('complete',false,'notices')">完成</button>
+      <button class="btn small" onclick="batchItems('silent',false,'notices')">静默</button>
+      <button class="btn small" onclick="batchItems('activate',false,'notices')">恢复进行中</button>
+      <button class="btn small danger" onclick="batchItems('delete',false,'notices')">删除</button>
+      <span id="batch-notice-msg" class="small"></span>
+    </div>
+
+    <table class="grid" id="notices-table">
+      <thead>
+        <tr>
+          <th class="col-chk"></th>
+          <th>事项</th><th>单位/联系人</th><th>分类</th>
+          <th>创建时间</th><th>状态</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="notices-body"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    </table>
+    <p class="muted small" style="padding:8px 4px">通知类邮件（投递成功、问卷、结果通知等）不再自动创建事项，可在「邮件」页查看与标注。</p>
+  </section>
+
+  <!-- ===== 邮件 ===== -->
+  <section id="view-emails" class="view">
+    <div class="toolbar">
+      <div class="filters">
+        <span class="muted small">手动拉取：</span>
+        <select id="fetch-account"></select>
+        <select id="fetch-range">
+          <option value="">从指定时间后</option>
+          <option value="3d" selected>近 3 天</option>
+          <option value="7d">近一周</option>
+          <option value="15d">近 15 天</option>
+          <option value="30d">近一个月</option>
+        </select>
+        <input type="datetime-local" id="fetch-since" class="small-input" title="从该时间之后拉取">
+        <button id="btn-fetch-mail" class="btn primary">拉取邮箱</button>
+        <span id="fetch-msg" class="small"></span>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="filters">
+        <select id="flt-mail-cat"><option value="">全部分类</option></select>
+        <select id="flt-mail-label"><option value="">全部标注</option></select>
+        <input id="flt-mail-q" type="search" placeholder="搜索主题/发件人/正文…">
+        <input type="datetime-local" id="flt-mail-since" class="small-input" title="发件时间从">
+        <span class="muted small">至</span>
+        <input type="datetime-local" id="flt-mail-before" class="small-input" title="发件时间至">
+        <button id="btn-refresh-emails" class="btn">刷新</button>
+      </div>
+    </div>
+    <div class="batchbar">
+      <label class="chk-all"><input type="checkbox" id="emails-check-all"> 全选本页</label>
+      <span class="muted small">批量：</span>
+      <select id="batch-mail-cat" class="small-input"></select>
+      <button class="btn small" onclick="batchEmails('reclassify')">重分类所选</button>
+      <button class="btn small danger" onclick="batchEmails('delete')">删除所选</button>
+      <span id="batch-mail-msg" class="small"></span>
+    </div>
+    <table class="grid" id="emails-table">
+      <thead>
+        <tr>
+          <th class="col-chk"></th>
+          <th>分类</th><th>主题</th><th>发件人</th>
+          <th>发件时间</th><th>收件入库</th><th>标注</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="emails-body"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- ===== 邮箱账户 ===== -->
+  <section id="view-accounts" class="view">
+    <div class="toolbar">
+      <div class="filters">
+        <button id="btn-refresh-accounts" class="btn">刷新</button>
+      </div>
+      <button id="btn-new-account" class="btn primary">＋ 添加邮箱</button>
+    </div>
+    <table class="grid" id="accounts-table">
+      <thead>
+        <tr><th>标签</th><th>地址</th><th>IMAP</th><th>SMTP</th><th>启用</th><th>默认</th><th>操作</th></tr>
+      </thead>
+      <tbody id="accounts-body"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- ===== 审批 ===== -->
+  <section id="view-approvals" class="view">
+    <div class="toolbar">
+      <div class="filters">
+        <select id="flt-approval-status">
+          <option value="pending">待处理</option>
+          <option value="">全部</option>
+          <option value="approved">已批准</option>
+          <option value="rejected">已拒绝</option>
+        </select>
+        <button id="btn-refresh-approvals" class="btn">刷新</button>
+      </div>
+    </div>
+    <table class="grid" id="approvals-table">
+      <thead>
+        <tr><th>ID</th><th>工具</th><th>申请内容</th><th>来源邮件</th><th>申请时间</th><th>状态</th><th>操作</th></tr>
+      </thead>
+      <tbody id="approvals-body"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- ===== 日志 ===== -->
+  <section id="view-logs" class="view">
+    <div class="toolbar">
+      <div class="filters">
+        <select id="flt-log-status">
+          <option value="">全部状态</option>
+          <option value="pending">待发送</option>
+          <option value="sent">已发送</option>
+          <option value="failed">失败</option>
+        </select>
+        <button id="btn-refresh-logs" class="btn">刷新</button>
+      </div>
+    </div>
+    <table class="grid" id="logs-table">
+      <thead>
+        <tr><th>事项</th><th>主题</th><th>类型</th><th>状态</th><th>尝试</th><th>计划时间</th><th>发送时间</th><th>下次重试</th><th>错误</th></tr>
+      </thead>
+      <tbody id="logs-body"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<!-- ===== 事项编辑弹窗 ===== -->
+<dialog id="dlg-item">
+  <form id="form-item" method="dialog">
+    <h3 id="dlg-title">新建事项</h3>
+    <input type="hidden" id="f-id">
+    <label>类型
+      <select id="f-kind">
+        <option value="todo">待办（事务预约）</option>
+        <option value="notification">通知</option>
+      </select>
+    </label>
+    <label>标题 <input id="f-title" placeholder="事项标题"></label>
+    <label>事件（5-10字，用于提醒主题） <input id="f-event" placeholder="如：技术面试"></label>
+    <label>单位/联系人（简短） <input id="f-party" placeholder="如：字节跳动"></label>
+    <label>分类
+      <select id="f-category"></select>
+      <button type="button" class="btn small" id="btn-add-cat" style="margin-top:6px">＋ 新增分类</button>
+    </label>
+    <label>截止时间（可选）
+      <input id="f-deadline" type="datetime-local">
+    </label>
+    <label>备注 <textarea id="f-notes" rows="3" placeholder="备注"></textarea></label>
+    <div class="dlg-actions">
+      <button type="button" class="btn" id="btn-dlg-cancel">取消</button>
+      <button type="submit" class="btn primary" id="btn-dlg-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ===== 邮件详情弹窗 ===== -->
+<dialog id="dlg-mail">
+  <h3 id="mail-title"></h3>
+  <div class="mail-meta" id="mail-meta"></div>
+  <div class="mail-reclassify">
+    <select id="reclass-cat"></select>
+    <button id="btn-reclassify" class="btn">重新分类</button>
+    <button id="btn-mail-label" class="btn" type="button">标注</button>
+    <span id="reclass-msg"></span>
+  </div>
+  <pre id="mail-body"></pre>
+  <div class="dlg-actions">
+    <button type="button" class="btn" id="btn-mail-close">关闭</button>
+  </div>
+</dialog>
+
+<!-- ===== 邮件标注弹窗 ===== -->
+<dialog id="dlg-label">
+  <h3>标注邮件 <span id="label-mail-subject" class="small muted"></span></h3>
+  <input type="hidden" id="l-email-id">
+  <label>标注
+    <select id="l-label">
+      <option value="">（清除标注）</option>
+      <option value="correct">分类正确</option>
+      <option value="wrong_category">分类错误</option>
+      <option value="should_todo">应建待办（未建）</option>
+      <option value="should_not_todo">不应建待办（已建）</option>
+      <option value="deadline_missing">漏截止时间</option>
+      <option value="other">其他</option>
+    </select>
+  </label>
+  <label>备注 <textarea id="l-note" rows="3" placeholder="说明问题，用于后续改进分类/建待办"></textarea></label>
+  <div class="dlg-actions">
+    <button type="button" class="btn" id="btn-label-cancel">取消</button>
+    <button type="button" class="btn danger" id="btn-label-clear">清除标注</button>
+    <span style="flex:1"></span>
+    <button type="button" class="btn primary" id="btn-label-save">保存</button>
+  </div>
+</dialog>
+
+<!-- ===== 账户编辑弹窗 ===== -->
+<dialog id="dlg-account">
+  <form id="form-account" method="dialog">
+    <h3 id="acct-title">添加邮箱</h3>
+    <input type="hidden" id="a-id">
+    <label>标签（如 求职邮箱） <input id="a-label" placeholder="标签"></label>
+    <label>邮件地址 <input id="a-address" placeholder="you@example.com" required></label>
+    <div class="two-col">
+      <label>IMAP 服务器 <input id="a-imap-host" placeholder="imap.example.com" required></label>
+      <label>IMAP 端口 <input id="a-imap-port" type="number" value="993"></label>
+      <label>IMAP 用户（留空=邮件地址） <input id="a-imap-user" placeholder="可选"></label>
+      <label>IMAP 密码 <input id="a-imap-password" type="password" placeholder="客户端专用密码" autocomplete="new-password"></label>
+      <label>SMTP 服务器 <input id="a-smtp-host" placeholder="smtp.example.com" required></label>
+      <label>SMTP 端口 <input id="a-smtp-port" type="number" value="465"></label>
+      <label>SMTP 用户（留空=邮件地址） <input id="a-smtp-user" placeholder="可选"></label>
+      <label>SMTP 密码 <input id="a-smtp-password" type="password" placeholder="客户端专用密码" autocomplete="new-password"></label>
+    </div>
+    <label class="chk"><input type="checkbox" id="a-imap-tls-insecure"> 跳过 IMAP 证书域名校验（加密保留）</label>
+    <label class="chk"><input type="checkbox" id="a-smtp-tls-insecure"> 跳过 SMTP 证书域名校验（加密保留）</label>
+    <label class="chk"><input type="checkbox" id="a-enabled" checked> 启用该账户</label>
+    <label>提醒目标邮箱（留空=默认提醒地址） <input id="a-reminder-to" placeholder="可选"></label>
+    <div class="dlg-actions">
+      <button type="button" class="btn" id="btn-acct-test">测试连接</button>
+      <span id="acct-test-msg" class="small"></span>
+      <span style="flex:1"></span>
+      <button type="button" class="btn" id="btn-acct-cancel">取消</button>
+      <button type="submit" class="btn primary" id="btn-acct-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

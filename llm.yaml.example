@@ -1,0 +1,29 @@
+# mail2 LLM（DeepSeek）配置
+api_key: "sk-xxxxxxxx"
+base_url: "https://api.deepseek.com"
+model: "deepseek-chat"
+# 单次请求超时（秒）
+timeout_secs: 60
+
+# Agent 模式（新邮件处理走 tool call；失败自动降级旧固定 prompt 路径）
+agent:
+  # true = 收到新邮件后由大模型 Agent 自主调用工具（读完整邮件/增查分类/建事项）；
+  # 删除/修改类操作会生成审批申请，需在 Web“审批”页批准。
+  enabled: true
+  # Agent 循环最大轮数（每轮可含多次工具调用）
+  max_tool_rounds: 8
+
+# 邮件分类类型（可增删改；id 用于内部标识，label 用于提醒主题【类型/...】与界面展示）
+# create_item: true 表示该类邮件自动创建事务（item），进入待办/通知管理
+# 注意：通知类（投递成功/问卷/结果通知等反馈式邮件）不建事项，create_item 必须为 false；
+# 待办仅自动创建于 面试/笔试/测评 三类，以及含明确截止时间（如“请在24H内完成”）的邮件。
+# 运行期分类存于数据库：Agent 可用 create_category 工具自主新增（如 线上测评），
+# 也可在 Web 待办页新建事项时手工新增；此处为首次启动的种子分类。
+categories:
+  - { id: todo,          label: "事务预约/待办", create_item: true }
+  - { id: interview,     label: "面试",         create_item: true }
+  - { id: assessment,    label: "测评",         create_item: true }
+  - { id: written_test,  label: "笔试",         create_item: true }
+  - { id: notification,  label: "通知类",       create_item: false }
+  - { id: conversation,  label: "对话交流型",   create_item: false }
+  - { id: misc,          label: "其他",         create_item: false }

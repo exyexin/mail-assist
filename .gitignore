@@ -1,0 +1,20 @@
+# 密钥与用户私有配置（绝不入库）
+config
+config.yaml
+llm.yaml
+
+# 运行数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 构建产物
+target/
+
+# 测试临时文件
+/tmp/
+*.log
+
+# 会话内部文件
+goal.md
