@@ -26,7 +26,7 @@ cmd_greenmail_rm()    { podman rm -f "$GREENMAIL_NAME" || true; }
 cmd_greenmail_status(){ podman ps --filter "name=$GREENMAIL_NAME" --format '{{.Names}} {{.Status}} {{.Ports}}'; }
 
 cmd_build() { cargo build --release; echo "产物: target/release/mail2"; }
-cmd_test()  { cargo test "$@"; }
+cmd_test()  { TZ="${TZ:-Asia/Shanghai}" cargo test "$@"; }  # 检查时刻测试依赖本地时区
 cmd_run()   { exec cargo run -- serve "${@:---config-dir .}"; }
 cmd_fetch() { exec cargo run -- fetch-once --config-dir .; }
 cmd_check() { exec cargo run -- check-once --config-dir .; }

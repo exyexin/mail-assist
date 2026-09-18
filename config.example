@@ -10,8 +10,15 @@ listen: "127.0.0.1:8080"
 # API 鉴权 token；为空则不鉴权（仅建议本机使用）
 auth_token: ""
 
-# 数据目录（SQLite 数据库位置）
+# 数据目录（日志与数据库默认位置）
 data_dir: "./data"
+
+# 数据库路径（可选；留空 = data_dir/mail.db 与 data_dir/todo.db）
+#   mail_db：邮件库（emails/accounts/agent_runs/kv 收信游标）
+#   todo_db：待办库（items/send_log/approvals/categories）
+# 首次启动会把旧的单库 data/mail2.db 自动拆分到这两个文件，旧文件改名 mail2.db.bak 保留。
+mail_db: ""
+todo_db: ""
 
 # 时区（影响 DDL 计算与每日检查时刻）；留空 = 系统本地时区
 timezone: "Asia/Shanghai"

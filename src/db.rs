@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::config::AppConfig;
@@ -15,192 +15,335 @@ use crate::model::{
     SendLog, SendStatus,
 };
 
+/// 数据库句柄：**邮件域**与**待办域**分属两个独立 SQLite 文件。
+///
+/// - `mail` 邮件库（`mail.db`）：emails / accounts / agent_runs / kv（收信游标、调度标记）
+/// - `todo` 待办库（`todo.db`）：items / send_log / approvals / categories
+///
+/// 两库之间只保留整数引用（`emails.item_id` ↔ `items.source_email_id`），不做外键约束；
+/// 跨域排序（待办按关联邮件收件时间）在应用层完成，因此不需要跨库 JOIN。
+/// 同一个 Mutex 保护两个连接，避免并发锁顺序问题。
 pub struct Db {
-    conn: Mutex<Connection>,
+    conns: Mutex<Conns>,
+}
+
+/// 两个数据库文件的连接集合。
+pub struct Conns {
+    pub mail: Connection,
+    pub todo: Connection,
+}
+
+/// 邮件库表结构（新建 + 旧库补列）。
+fn mail_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid INTEGER,
+            message_id TEXT NOT NULL UNIQUE,
+            subject TEXT NOT NULL DEFAULT '',
+            from_addr TEXT NOT NULL DEFAULT '',
+            from_name TEXT NOT NULL DEFAULT '',
+            body_text TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            sent_at TEXT NOT NULL DEFAULT '',
+            received_at TEXT NOT NULL DEFAULT '',
+            item_id INTEGER,
+            reply_to_item_id INTEGER,
+            account_id INTEGER NOT NULL DEFAULT 1,
+            handled INTEGER NOT NULL DEFAULT 0,
+            user_label TEXT NOT NULL DEFAULT '',
+            user_note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL DEFAULT '',
+            imap_host TEXT NOT NULL DEFAULT '',
+            imap_port INTEGER NOT NULL DEFAULT 993,
+            imap_user TEXT NOT NULL DEFAULT '',
+            imap_password TEXT NOT NULL DEFAULT '',
+            imap_tls_insecure INTEGER NOT NULL DEFAULT 0,
+            smtp_host TEXT NOT NULL DEFAULT '',
+            smtp_port INTEGER NOT NULL DEFAULT 465,
+            smtp_user TEXT NOT NULL DEFAULT '',
+            smtp_password TEXT NOT NULL DEFAULT '',
+            smtp_tls_insecure INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            reminder_to TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER,
+            account_id INTEGER NOT NULL DEFAULT 1,
+            rounds INTEGER NOT NULL DEFAULT 0,
+            tool_calls INTEGER NOT NULL DEFAULT 0,
+            final_json TEXT NOT NULL DEFAULT '',
+            trace TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'ok',
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_emails_category ON emails(category);
+        "#,
+    )
+    .context("邮件库建表失败")?;
+    // 旧库补列（存在即跳过）
+    if !column_exists(conn, "emails", "sent_at")? {
+        conn.execute_batch("ALTER TABLE emails ADD COLUMN sent_at TEXT NOT NULL DEFAULT '';")
+            .context("emails.sent_at 迁移失败")?;
+    }
+    if !column_exists(conn, "emails", "account_id")? {
+        conn.execute_batch("ALTER TABLE emails ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;")
+            .context("emails.account_id 迁移失败")?;
+    }
+    if !column_exists(conn, "emails", "user_label")? {
+        conn.execute_batch("ALTER TABLE emails ADD COLUMN user_label TEXT NOT NULL DEFAULT '';")
+            .context("emails.user_label 迁移失败")?;
+    }
+    if !column_exists(conn, "emails", "user_note")? {
+        conn.execute_batch("ALTER TABLE emails ADD COLUMN user_note TEXT NOT NULL DEFAULT '';")
+            .context("emails.user_note 迁移失败")?;
+    }
+    Ok(())
+}
+
+/// 待办库表结构（新建 + 旧库补列 + 分类规则迁移）。
+fn todo_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL DEFAULT 'todo',
+            title TEXT NOT NULL DEFAULT '',
+            party TEXT NOT NULL DEFAULT '',
+            event TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            deadline TEXT,
+            remind_at TEXT,
+            remind_policy TEXT NOT NULL DEFAULT 'normal',
+            needs_review INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            source_email_id INTEGER,
+            account_id INTEGER NOT NULL DEFAULT 1,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS send_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'reminder',
+            to_addr TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            scheduled_at TEXT NOT NULL DEFAULT '',
+            sent_at TEXT,
+            next_retry_at TEXT,
+            message_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS categories (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            create_item INTEGER NOT NULL DEFAULT 1,
+            kind TEXT NOT NULL DEFAULT 'todo',
+            source TEXT NOT NULL DEFAULT 'builtin',
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            source_email_id INTEGER,
+            decided_at TEXT,
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sendlog_item_sched ON send_log(item_id, scheduled_at);
+        CREATE INDEX IF NOT EXISTS idx_sendlog_status ON send_log(status);
+        CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
+        CREATE INDEX IF NOT EXISTS idx_items_deadline ON items(deadline);
+        "#,
+    )
+    .context("待办库建表失败")?;
+    if !column_exists(conn, "items", "account_id")? {
+        conn.execute_batch("ALTER TABLE items ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;")
+            .context("items.account_id 迁移失败")?;
+    }
+    if !column_exists(conn, "items", "remind_policy")? {
+        conn.execute_batch(
+            "ALTER TABLE items ADD COLUMN remind_policy TEXT NOT NULL DEFAULT 'normal';",
+        )
+        .context("items.remind_policy 迁移失败")?;
+    }
+    // 通知类邮件不再自动创建事项
+    conn.execute(
+        "UPDATE categories SET create_item=0, kind='notification' WHERE id='notification'",
+        [],
+    )
+    .context("通知分类建项规则迁移失败")?;
+    // 招聘推广分类（宣讲会/双选会/网申推荐/投递邀请）：开箱即用，默认不建项
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (id,label,create_item,kind,source,created_at)
+         VALUES ('career_promo','招聘推广',0,'notification','builtin',?1)",
+        params![now_str()],
+    )
+    .context("招聘推广分类迁移失败")?;
+    // 历史遗留：曾由 Agent 自建、默认建项的推广类分类（如 career_talk）统一改为不建项
+    conn.execute(
+        "UPDATE categories SET create_item=0, kind='notification'
+         WHERE source='llm' AND (id IN ('career_talk','宣讲会','campus_talk') OR label LIKE '%宣讲%' OR label LIKE '%推广%')",
+        [],
+    )
+    .context("推广分类建项规则迁移失败")?;
+    conn.pragma_update(None, "user_version", 5)
+        .context("设置 user_version 失败")?;
+    Ok(())
+}
+
+/// 首次启动时把旧的单库 `mail2.db` 拆分到 `mail.db` + `todo.db`（旧文件改名 `.bak` 保留）。
+///
+/// 仅当旧文件存在、且两个新文件都还不存在时执行；数据按表归属分别复制（显式列名，容忍旧结构缺列）。
+fn split_legacy_database(legacy: &Path, mail_path: &Path, todo_path: &Path) -> Result<bool> {
+    if !legacy.exists() || mail_path.exists() || todo_path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open(legacy)
+        .with_context(|| format!("打开旧库 {} 失败", legacy.display()))?;
+    // 旧库先补齐两域的表与列，保证复制时列齐全
+    mail_schema(&conn)?;
+    todo_schema(&conn)?;
+    // 先建立两个新库的表结构（独立连接创建，随后用 ATTACH 复制数据）
+    {
+        let m = Connection::open(mail_path)
+            .with_context(|| format!("创建邮件库 {} 失败", mail_path.display()))?;
+        mail_schema(&m)?;
+        let t = Connection::open(todo_path)
+            .with_context(|| format!("创建待办库 {} 失败", todo_path.display()))?;
+        todo_schema(&t)?;
+    }
+    conn.execute("ATTACH DATABASE ?1 AS newmail", params![mail_path.to_string_lossy()])
+        .context("附加新邮件库失败")?;
+    conn.execute("ATTACH DATABASE ?1 AS newtodo", params![todo_path.to_string_lossy()])
+        .context("附加新待办库失败")?;
+    let copy_sql = r#"
+        INSERT OR IGNORE INTO newmail.emails
+            (id,uid,message_id,subject,from_addr,from_name,body_text,category,sent_at,received_at,
+             item_id,reply_to_item_id,account_id,handled,user_label,user_note)
+        SELECT id,uid,message_id,subject,from_addr,from_name,body_text,category,sent_at,received_at,
+             item_id,reply_to_item_id,account_id,handled,user_label,user_note FROM main.emails;
+        INSERT OR IGNORE INTO newmail.accounts
+            (id,label,address,imap_host,imap_port,imap_user,imap_password,imap_tls_insecure,
+             smtp_host,smtp_port,smtp_user,smtp_password,smtp_tls_insecure,enabled,is_default,
+             reminder_to,created_at,updated_at)
+        SELECT id,label,address,imap_host,imap_port,imap_user,imap_password,imap_tls_insecure,
+             smtp_host,smtp_port,smtp_user,smtp_password,smtp_tls_insecure,enabled,is_default,
+             reminder_to,created_at,updated_at FROM main.accounts;
+        INSERT OR IGNORE INTO newmail.agent_runs
+            (id,email_id,account_id,rounds,tool_calls,final_json,trace,status,created_at)
+        SELECT id,email_id,account_id,rounds,tool_calls,final_json,trace,status,created_at FROM main.agent_runs;
+        INSERT OR IGNORE INTO newmail.kv (k,v) SELECT k,v FROM main.kv;
+
+        INSERT OR IGNORE INTO newtodo.items
+            (id,kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,
+             source_email_id,account_id,notes,created_at,updated_at)
+        SELECT id,kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,
+             source_email_id,account_id,notes,created_at,updated_at FROM main.items;
+        INSERT OR IGNORE INTO newtodo.send_log
+            (id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id)
+        SELECT id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id FROM main.send_log;
+        INSERT OR IGNORE INTO newtodo.categories (id,label,create_item,kind,source,created_at)
+        SELECT id,label,create_item,kind,source,created_at FROM main.categories;
+        INSERT OR IGNORE INTO newtodo.approvals
+            (id,tool_name,payload_json,summary,status,source_email_id,decided_at,created_at)
+        SELECT id,tool_name,payload_json,summary,status,source_email_id,decided_at,created_at FROM main.approvals;
+    "#;
+    conn.execute_batch(copy_sql).context("拆分旧库数据失败")?;
+    let emails: i64 = conn
+        .query_row("SELECT COUNT(*) FROM newmail.emails", [], |r| r.get(0))
+        .context("统计新邮件库失败")?;
+    let items: i64 = conn
+        .query_row("SELECT COUNT(*) FROM newtodo.items", [], |r| r.get(0))
+        .context("统计新待办库失败")?;
+    conn.execute_batch("DETACH DATABASE newmail; DETACH DATABASE newtodo;")
+        .context("分离新库失败")?;
+    drop(conn);
+    // 旧文件改名保留（含 WAL/SHM 附属文件）
+    let bak = legacy.with_extension("db.bak");
+    std::fs::rename(legacy, &bak)
+        .with_context(|| format!("重命名旧库为 {} 失败", bak.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", legacy.display()));
+        if side.exists() {
+            let _ = std::fs::rename(&side, PathBuf::from(format!("{}{suffix}", bak.display())));
+        }
+    }
+    tracing::info!(
+        "已拆分旧库 {} → {}（emails={emails}）+ {}（items={items}），旧文件保留为 {}",
+        legacy.display(),
+        mail_path.display(),
+        todo_path.display(),
+        bak.display()
+    );
+    Ok(true)
 }
 
 impl Db {
-    pub fn open(data_dir: PathBuf) -> Result<Db> {
+    /// 打开（必要时创建）邮件库与待办库；`path` 为 `None` 时使用 data_dir 下的默认文件名。
+    pub fn open(data_dir: PathBuf, mail_db: Option<PathBuf>, todo_db: Option<PathBuf>) -> Result<Db> {
         std::fs::create_dir_all(&data_dir).with_context(|| "创建数据目录失败")?;
-        let path = data_dir.join("mail2.db");
-        let conn =
-            Connection::open(&path).with_context(|| format!("打开数据库 {}", path.display()))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA foreign_keys=ON;",
-        )
-        .context("初始化 PRAGMA 失败")?;
+        let mail_path = mail_db.unwrap_or_else(|| data_dir.join("mail.db"));
+        let todo_path = todo_db.unwrap_or_else(|| data_dir.join("todo.db"));
+        for p in [&mail_path, &todo_path] {
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建数据库目录 {} 失败", parent.display()))?;
+            }
+        }
+        // 旧单库自动拆分（一次性）
+        split_legacy_database(&data_dir.join("mail2.db"), &mail_path, &todo_path)?;
+
+        let mail = Connection::open(&mail_path)
+            .with_context(|| format!("打开邮件库 {}", mail_path.display()))?;
+        let todo = Connection::open(&todo_path)
+            .with_context(|| format!("打开待办库 {}", todo_path.display()))?;
+        for c in [&mail, &todo] {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .context("初始化 PRAGMA 失败")?;
+        }
         let db = Db {
-            conn: Mutex::new(conn),
+            conns: Mutex::new(Conns { mail, todo }),
         };
         db.migrate()?;
         Ok(db)
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("db mutex poisoned")
+    fn conns(&self) -> std::sync::MutexGuard<'_, Conns> {
+        self.conns.lock().expect("db mutex poisoned")
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS emails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uid INTEGER,
-                message_id TEXT NOT NULL UNIQUE,
-                subject TEXT NOT NULL DEFAULT '',
-                from_addr TEXT NOT NULL DEFAULT '',
-                from_name TEXT NOT NULL DEFAULT '',
-                body_text TEXT NOT NULL DEFAULT '',
-                category TEXT NOT NULL DEFAULT '',
-                sent_at TEXT NOT NULL DEFAULT '',
-                received_at TEXT NOT NULL DEFAULT '',
-                item_id INTEGER,
-                reply_to_item_id INTEGER,
-                account_id INTEGER NOT NULL DEFAULT 1,
-                handled INTEGER NOT NULL DEFAULT 0,
-                user_label TEXT NOT NULL DEFAULT '',
-                user_note TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL DEFAULT 'todo',
-                title TEXT NOT NULL DEFAULT '',
-                party TEXT NOT NULL DEFAULT '',
-                event TEXT NOT NULL DEFAULT '',
-                category TEXT NOT NULL DEFAULT '',
-                deadline TEXT,
-                remind_at TEXT,
-                needs_review INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'active',
-                source_email_id INTEGER,
-                account_id INTEGER NOT NULL DEFAULT 1,
-                notes TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS send_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_id INTEGER NOT NULL,
-                attempt INTEGER NOT NULL DEFAULT 0,
-                kind TEXT NOT NULL DEFAULT 'reminder',
-                to_addr TEXT NOT NULL DEFAULT '',
-                subject TEXT NOT NULL DEFAULT '',
-                body TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'pending',
-                error TEXT,
-                scheduled_at TEXT NOT NULL DEFAULT '',
-                sent_at TEXT,
-                next_retry_at TEXT,
-                message_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                label TEXT NOT NULL DEFAULT '',
-                address TEXT NOT NULL DEFAULT '',
-                imap_host TEXT NOT NULL DEFAULT '',
-                imap_port INTEGER NOT NULL DEFAULT 993,
-                imap_user TEXT NOT NULL DEFAULT '',
-                imap_password TEXT NOT NULL DEFAULT '',
-                imap_tls_insecure INTEGER NOT NULL DEFAULT 0,
-                smtp_host TEXT NOT NULL DEFAULT '',
-                smtp_port INTEGER NOT NULL DEFAULT 465,
-                smtp_user TEXT NOT NULL DEFAULT '',
-                smtp_password TEXT NOT NULL DEFAULT '',
-                smtp_tls_insecure INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                reminder_to TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS categories (
-                id TEXT PRIMARY KEY,
-                label TEXT NOT NULL DEFAULT '',
-                create_item INTEGER NOT NULL DEFAULT 1,
-                kind TEXT NOT NULL DEFAULT 'todo',
-                source TEXT NOT NULL DEFAULT 'builtin',
-                created_at TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS approvals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tool_name TEXT NOT NULL DEFAULT '',
-                payload_json TEXT NOT NULL DEFAULT '',
-                summary TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'pending',
-                source_email_id INTEGER,
-                decided_at TEXT,
-                created_at TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS agent_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email_id INTEGER,
-                account_id INTEGER NOT NULL DEFAULT 1,
-                rounds INTEGER NOT NULL DEFAULT 0,
-                tool_calls INTEGER NOT NULL DEFAULT 0,
-                final_json TEXT NOT NULL DEFAULT '',
-                trace TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'ok',
-                created_at TEXT NOT NULL DEFAULT ''
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_sendlog_item_sched ON send_log(item_id, scheduled_at);
-            CREATE INDEX IF NOT EXISTS idx_sendlog_status ON send_log(status);
-            CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
-            CREATE INDEX IF NOT EXISTS idx_items_deadline ON items(deadline);
-            CREATE INDEX IF NOT EXISTS idx_emails_category ON emails(category);
-            CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-            "#,
-        )
-        .context("建表失败")?;
-
-        // 旧库补列（存在即跳过）
-        if !column_exists(&conn, "emails", "sent_at")? {
-            conn.execute_batch(
-                "ALTER TABLE emails ADD COLUMN sent_at TEXT NOT NULL DEFAULT '';",
-            )
-            .context("emails.sent_at 迁移失败")?;
-        }
-        if !column_exists(&conn, "emails", "account_id")? {
-            conn.execute_batch(
-                "ALTER TABLE emails ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;",
-            )
-            .context("emails.account_id 迁移失败")?;
-        }
-        if !column_exists(&conn, "items", "account_id")? {
-            conn.execute_batch(
-                "ALTER TABLE items ADD COLUMN account_id INTEGER NOT NULL DEFAULT 1;",
-            )
-            .context("items.account_id 迁移失败")?;
-        }
-        // 邮件用户标注（需求：手动标注，用于后续改进分类/建待办）
-        if !column_exists(&conn, "emails", "user_label")? {
-            conn.execute_batch(
-                "ALTER TABLE emails ADD COLUMN user_label TEXT NOT NULL DEFAULT '';",
-            )
-            .context("emails.user_label 迁移失败")?;
-        }
-        if !column_exists(&conn, "emails", "user_note")? {
-            conn.execute_batch(
-                "ALTER TABLE emails ADD COLUMN user_note TEXT NOT NULL DEFAULT '';",
-            )
-            .context("emails.user_note 迁移失败")?;
-        }
-        // 通知类邮件不再自动创建事项（需求：待办仅含 面试/笔试/测评 与有截止时间的邮件）
-        conn.execute(
-            "UPDATE categories SET create_item=0, kind='notification' WHERE id='notification'",
-            [],
-        )
-        .context("通知分类建项规则迁移失败")?;
-        conn.pragma_update(None, "user_version", 4)
-            .context("设置 user_version 失败")?;
+        let c = self.conns();
+        mail_schema(&c.mail)?;
+        todo_schema(&c.todo)?;
         Ok(())
     }
 
-    /// 首次启动种子：config 静态邮箱 → 默认账户；llm.yaml 分类 → categories。
+    /// 首次启动种子：config 静态邮箱 → 默认账户（邮件库）；llm.yaml 分类 → categories（待办库）。
     pub fn seed_defaults(&self, cfg: &AppConfig) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
             .context("统计账户失败")?;
@@ -229,31 +372,31 @@ impl Db {
             )
             .context("种子默认账户失败")?;
         }
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
-            .context("统计分类失败")?;
-        if n == 0 {
-            for c in &cfg.llm.categories {
-                conn.execute(
-                    "INSERT OR IGNORE INTO categories (id,label,create_item,kind,source,created_at)
-                     VALUES (?1,?2,?3,?4,'builtin',?5)",
-                    params![
-                        c.id,
-                        c.label,
-                        c.create_item as i64,
-                        default_kind(&c.id, c.create_item),
-                        now_str(),
-                    ],
-                )
-                .context("种子分类失败")?;
-            }
+        // 分类：始终补齐 llm.yaml 中的种子分类（INSERT OR IGNORE，幂等）。
+        // 注意：不能再用“表为空才种子”的判断——迁移会预先插入 career_promo，
+        // 会导致整套种子分类缺失（Agent 只能自建分类，分类质量崩坏）。
+        let conn = &c.todo;
+        for c in &cfg.llm.categories {
+            conn.execute(
+                "INSERT OR IGNORE INTO categories (id,label,create_item,kind,source,created_at)
+                 VALUES (?1,?2,?3,?4,'builtin',?5)",
+                params![
+                    c.id,
+                    c.label,
+                    c.create_item as i64,
+                    default_kind(&c.id, c.create_item),
+                    now_str(),
+                ],
+            )
+            .context("种子分类失败")?;
         }
         Ok(())
     }
 
     // ---------- kv ----------
     pub fn kv_get(&self, k: &str) -> Result<Option<String>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let v: Option<String> = conn
             .query_row("SELECT v FROM kv WHERE k=?1", params![k], |r| r.get(0))
             .optional()
@@ -262,7 +405,8 @@ impl Db {
     }
 
     pub fn kv_set(&self, k: &str, v: &str) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "INSERT INTO kv(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             params![k, v],
@@ -274,7 +418,8 @@ impl Db {
     // ---------- emails ----------
     /// 插入邮件；message_id 已存在则返回 Ok(None)（去重）。
     pub fn insert_email(&self, e: &EmailRecord) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO emails
@@ -303,7 +448,8 @@ impl Db {
     }
 
     pub fn update_email_category(&self, id: i64, category: &str) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "UPDATE emails SET category=?1 WHERE id=?2",
             params![category, id],
@@ -313,7 +459,8 @@ impl Db {
     }
 
     pub fn set_email_item(&self, id: i64, item_id: i64) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "UPDATE emails SET item_id=?1 WHERE id=?2",
             params![item_id, id],
@@ -324,7 +471,8 @@ impl Db {
 
     /// 保存/清除用户标注（label 为空 = 清除标注）。
     pub fn update_email_label(&self, id: i64, label: &str, note: &str) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "UPDATE emails SET user_label=?1, user_note=?2 WHERE id=?3",
             params![label, note, id],
@@ -333,9 +481,32 @@ impl Db {
         Ok(())
     }
 
+    /// 解除邮件与事项的关联（撤销误建待办时使用）。
+    pub fn clear_email_item(&self, id: i64) -> Result<()> {
+        let c = self.conns();
+        let conn = &c.mail;
+        conn.execute("UPDATE emails SET item_id=NULL WHERE id=?1", params![id])
+            .context("clear_email_item 失败")?;
+        Ok(())
+    }
+
+    /// 删除某事项尚未发送的提醒记录（截止时间变更后重建，避免发出过期内容）。
+    pub fn delete_unsent_send_logs(&self, item_id: i64) -> Result<usize> {
+        let c = self.conns();
+        let conn = &c.todo;
+        let n = conn
+            .execute(
+                "DELETE FROM send_log WHERE item_id=?1 AND status<>'sent'",
+                params![item_id],
+            )
+            .context("delete_unsent_send_logs 失败")?;
+        Ok(n)
+    }
+
     /// 邮件对应的事项 id（agent 幂等检查用）
     pub fn item_for_email(&self, email_id: i64) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let v: Option<Option<i64>> = conn
             .query_row(
                 "SELECT item_id FROM emails WHERE id=?1",
@@ -348,14 +519,16 @@ impl Db {
     }
 
     pub fn delete_email(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute("DELETE FROM emails WHERE id=?1", params![id])
             .context("delete_email 失败")?;
         Ok(())
     }
 
     pub fn get_email(&self, id: i64) -> Result<Option<EmailRecord>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let e = conn
             .query_row(
                 "SELECT id, uid, message_id, subject, from_addr, from_name, body_text, category,
@@ -371,7 +544,8 @@ impl Db {
     }
 
     pub fn list_emails(&self, f: &EmailFilter) -> Result<Vec<EmailRecord>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let mut sql = String::from(
             "SELECT id, uid, message_id, subject, from_addr, from_name, body_text, category,
                     sent_at, received_at, item_id, reply_to_item_id, account_id, handled,
@@ -440,7 +614,8 @@ impl Db {
     }
 
     pub fn batch_update_email_category(&self, ids: &[i64], category: &str) -> Result<usize> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let mut n = 0;
         for id in ids {
             n += conn
@@ -454,7 +629,8 @@ impl Db {
     }
 
     pub fn batch_delete_emails(&self, ids: &[i64]) -> Result<usize> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let mut n = 0;
         for id in ids {
             n += conn
@@ -466,10 +642,11 @@ impl Db {
 
     // ---------- items ----------
     pub fn insert_item(&self, it: &Item) -> Result<i64> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
-            "INSERT INTO items (kind,title,party,event,category,deadline,remind_at,needs_review,status,source_email_id,account_id,notes,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO items (kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,source_email_id,account_id,notes,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 it.kind.as_str(),
                 it.title,
@@ -478,6 +655,7 @@ impl Db {
                 it.category,
                 it.deadline,
                 it.remind_at,
+                it.remind_policy,
                 it.needs_review as i64,
                 it.status.as_str(),
                 it.source_email_id,
@@ -492,10 +670,11 @@ impl Db {
     }
 
     pub fn update_item(&self, it: &Item) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "UPDATE items SET kind=?1,title=?2,party=?3,event=?4,category=?5,deadline=?6,remind_at=?7,
-                    needs_review=?8,status=?9,notes=?10,updated_at=?11 WHERE id=?12",
+                    remind_policy=?8,needs_review=?9,status=?10,notes=?11,updated_at=?12 WHERE id=?13",
             params![
                 it.kind.as_str(),
                 it.title,
@@ -504,6 +683,7 @@ impl Db {
                 it.category,
                 it.deadline,
                 it.remind_at,
+                it.remind_policy,
                 it.needs_review as i64,
                 it.status.as_str(),
                 it.notes,
@@ -515,8 +695,52 @@ impl Db {
         Ok(())
     }
 
+    /// 列出某账户的全部 active 待办（合并同公司同类型事项时用于候选筛选，规模很小）。
+    pub fn list_active_todo_items(&self, account_id: i64) -> Result<Vec<Item>> {
+        let c = self.conns();
+        let conn = &c.todo;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,
+                        source_email_id,account_id,notes,created_at,updated_at
+                 FROM items
+                 WHERE account_id=?1 AND status='active' AND kind='todo'
+                 ORDER BY id ASC",
+            )
+            .context("list_active_todo_items 失败")?;
+        let rows = stmt
+            .query_map(params![account_id], row_to_item)
+            .context("list_active_todo_items 查询失败")?;
+        let out: Vec<Item> = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(out)
+    }
+
+    /// 查找同主题 + 同发件人的历史邮件（用于重复邮件识别）。
+    pub fn find_email_by_subject_from(
+        &self,
+        subject: &str,
+        from_addr: &str,
+        exclude_id: i64,
+    ) -> Result<Option<EmailRecord>> {
+        let c = self.conns();
+        let conn = &c.mail;
+        let e = conn
+            .query_row(
+                "SELECT id,uid,message_id,subject,from_addr,from_name,body_text,category,sent_at,received_at,
+                        item_id,reply_to_item_id,account_id,handled,user_label,user_note
+                 FROM emails WHERE subject=?1 AND from_addr=?2 AND id<>?3
+                 ORDER BY id DESC LIMIT 1",
+                params![subject, from_addr, exclude_id],
+                row_to_email,
+            )
+            .optional()
+            .context("find_email_by_subject_from 失败")?;
+        Ok(e)
+    }
+
     pub fn delete_item(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute("DELETE FROM items WHERE id=?1", params![id])
             .context("delete_item 失败")?;
         conn.execute("DELETE FROM send_log WHERE item_id=?1", params![id])
@@ -525,7 +749,8 @@ impl Db {
     }
 
     pub fn set_item_status(&self, id: i64, status: ItemStatus) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "UPDATE items SET status=?1, updated_at=?2 WHERE id=?3",
             params![status.as_str(), crate::db::now_str(), id],
@@ -535,10 +760,11 @@ impl Db {
     }
 
     pub fn get_item(&self, id: i64) -> Result<Option<Item>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let it = conn
             .query_row(
-                "SELECT id,kind,title,party,event,category,deadline,remind_at,needs_review,status,
+                "SELECT id,kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,
                         source_email_id,account_id,notes,created_at,updated_at
                  FROM items WHERE id=?1",
                 params![id],
@@ -550,9 +776,10 @@ impl Db {
     }
 
     pub fn list_items(&self, f: &ItemFilter) -> Result<Vec<Item>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut sql = String::from(
-            "SELECT id,kind,title,party,event,category,deadline,remind_at,needs_review,status,
+            "SELECT id,kind,title,party,event,category,deadline,remind_at,remind_policy,needs_review,status,
                     source_email_id,account_id,notes,created_at,updated_at
              FROM items WHERE 1=1",
         );
@@ -606,7 +833,7 @@ impl Db {
             (None, None, None) => true,
             (None, _, _) => false, // 无截止时间不满足截止区间
         });
-        let recv_at = email_received_at_map(&conn, &out)?;
+        let recv_at = email_received_at_map(&c.mail, &out)?;
         out.sort_by(|a, b| {
             let ka = a.source_email_id.and_then(|id| recv_at.get(&id)).map(|s| s.as_str()).unwrap_or(&a.created_at);
             let kb = b.source_email_id.and_then(|id| recv_at.get(&id)).map(|s| s.as_str()).unwrap_or(&b.created_at);
@@ -633,7 +860,8 @@ impl Db {
                 }
             }
         }
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut n = 0;
         for id in ids {
             n += conn
@@ -647,7 +875,8 @@ impl Db {
     }
 
     pub fn distinct_parties(&self, limit: usize) -> Result<Vec<String>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT party FROM items WHERE party<>'' ORDER BY party LIMIT ?1",
@@ -660,7 +889,8 @@ impl Db {
     }
 
     pub fn batch_items_status(&self, ids: &[i64], status: ItemStatus) -> Result<usize> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut n = 0;
         for id in ids {
             n += conn
@@ -674,7 +904,8 @@ impl Db {
     }
 
     pub fn batch_items_delete(&self, ids: &[i64]) -> Result<usize> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut n = 0;
         for id in ids {
             n += conn
@@ -688,7 +919,8 @@ impl Db {
 
     // ---------- accounts ----------
     pub fn insert_account(&self, a: &MailAccount) -> Result<i64> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "INSERT INTO accounts (label,address,imap_host,imap_port,imap_user,imap_password,imap_tls_insecure,
                     smtp_host,smtp_port,smtp_user,smtp_password,smtp_tls_insecure,enabled,is_default,reminder_to,created_at,updated_at)
@@ -718,7 +950,8 @@ impl Db {
     }
 
     pub fn update_account(&self, a: &MailAccount) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "UPDATE accounts SET label=?1,address=?2,imap_host=?3,imap_port=?4,imap_user=?5,imap_password=?6,
                     imap_tls_insecure=?7,smtp_host=?8,smtp_port=?9,smtp_user=?10,smtp_password=?11,
@@ -748,14 +981,16 @@ impl Db {
     }
 
     pub fn delete_account(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute("DELETE FROM accounts WHERE id=?1", params![id])
             .context("delete_account 失败")?;
         Ok(())
     }
 
     pub fn get_account(&self, id: i64) -> Result<Option<MailAccount>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let a = conn
             .query_row(
                 "SELECT id,label,address,imap_host,imap_port,imap_user,imap_password,imap_tls_insecure,
@@ -771,7 +1006,8 @@ impl Db {
     }
 
     pub fn list_accounts(&self, enabled_only: bool) -> Result<Vec<MailAccount>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let sql = if enabled_only {
             "SELECT id,label,address,imap_host,imap_port,imap_user,imap_password,imap_tls_insecure,
                     smtp_host,smtp_port,smtp_user,smtp_password,smtp_tls_insecure,enabled,is_default,
@@ -791,7 +1027,8 @@ impl Db {
     }
 
     pub fn set_default_account(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute("UPDATE accounts SET is_default=0", [])
             .context("set_default_account 失败")?;
         conn.execute("UPDATE accounts SET is_default=1 WHERE id=?1", params![id])
@@ -800,7 +1037,8 @@ impl Db {
     }
 
     pub fn default_account_id(&self) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let v: Option<i64> = conn
             .query_row(
                 "SELECT id FROM accounts WHERE is_default=1 LIMIT 1",
@@ -814,7 +1052,8 @@ impl Db {
 
     // ---------- categories ----------
     pub fn list_categories(&self) -> Result<Vec<CategoryInfo>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut stmt = conn
             .prepare(
                 "SELECT id,label,create_item,kind,source,created_at FROM categories ORDER BY id",
@@ -836,7 +1075,8 @@ impl Db {
     }
 
     pub fn get_category(&self, id: &str) -> Result<Option<CategoryInfo>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let c = conn
             .query_row(
                 "SELECT id,label,create_item,kind,source,created_at FROM categories WHERE id=?1",
@@ -866,7 +1106,8 @@ impl Db {
         kind: &str,
         source: &str,
     ) -> Result<bool> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let exists: i64 = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM categories WHERE id=?1)",
@@ -899,7 +1140,8 @@ impl Db {
         summary: &str,
         source_email_id: Option<i64>,
     ) -> Result<i64> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "INSERT INTO approvals (tool_name,payload_json,summary,status,source_email_id,created_at)
              VALUES (?1,?2,?3,'pending',?4,?5)",
@@ -910,7 +1152,8 @@ impl Db {
     }
 
     pub fn list_approvals(&self, status: Option<&str>, limit: usize) -> Result<Vec<Approval>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut sql = String::from(
             "SELECT id,tool_name,payload_json,summary,status,source_email_id,decided_at,created_at
              FROM approvals WHERE 1=1",
@@ -934,7 +1177,8 @@ impl Db {
     }
 
     pub fn get_approval(&self, id: i64) -> Result<Option<Approval>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let a = conn
             .query_row(
                 "SELECT id,tool_name,payload_json,summary,status,source_email_id,decided_at,created_at
@@ -948,7 +1192,8 @@ impl Db {
     }
 
     pub fn decide_approval(&self, id: i64, status: &str, decided_at: &str) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "UPDATE approvals SET status=?1, decided_at=?2 WHERE id=?3",
             params![status, decided_at, id],
@@ -959,7 +1204,8 @@ impl Db {
 
     // ---------- agent_runs ----------
     pub fn insert_agent_run(&self, r: &AgentRun) -> Result<i64> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         conn.execute(
             "INSERT INTO agent_runs (email_id,account_id,rounds,tool_calls,final_json,trace,status,created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -979,7 +1225,8 @@ impl Db {
     }
 
     pub fn list_agent_runs(&self, limit: usize) -> Result<Vec<AgentRun>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.mail;
         let mut stmt = conn
             .prepare(
                 "SELECT id,email_id,account_id,rounds,tool_calls,final_json,trace,status,created_at
@@ -1006,7 +1253,8 @@ impl Db {
 
     // ---------- send_log ----------
     pub fn insert_send_log(&self, log: &SendLog) -> Result<i64> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "INSERT OR IGNORE INTO send_log
              (item_id, attempt, kind, to_addr, subject, body, status, error, scheduled_at, sent_at, next_retry_at, message_id)
@@ -1031,7 +1279,8 @@ impl Db {
     }
 
     pub fn update_send_log(&self, log: &SendLog) -> Result<()> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         conn.execute(
             "UPDATE send_log SET attempt=?1,status=?2,error=?3,sent_at=?4,next_retry_at=?5,message_id=?6 WHERE id=?7",
             params![
@@ -1050,7 +1299,8 @@ impl Db {
 
     /// 按 (item_id, scheduled_at) 幂等键查找已有发送记录。
     pub fn find_send_log(&self, item_id: i64, scheduled_at: &str) -> Result<Option<SendLog>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let log = conn
             .query_row(
                 "SELECT id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id
@@ -1069,7 +1319,8 @@ impl Db {
         status: Option<SendStatus>,
         limit: usize,
     ) -> Result<Vec<SendLog>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut sql = String::from(
             "SELECT id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id
              FROM send_log WHERE 1=1",
@@ -1098,7 +1349,8 @@ impl Db {
     /// 需要处理的重试/待发日志：pending 全部 + failed 且 next_retry_at 已到。
     pub fn logs_due(&self) -> Result<Vec<SendLog>> {
         let now = now_str();
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let mut stmt = conn
             .prepare(
                 "SELECT id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id
@@ -1116,7 +1368,8 @@ impl Db {
 
     /// 按提醒邮件 message-id 反查发送记录（回复识别）。
     pub fn find_send_log_by_message_id(&self, message_id: &str) -> Result<Option<SendLog>> {
-        let conn = self.conn();
+        let c = self.conns();
+        let conn = &c.todo;
         let log = conn
             .query_row(
                 "SELECT id,item_id,attempt,kind,to_addr,subject,body,status,error,scheduled_at,sent_at,next_retry_at,message_id
@@ -1272,7 +1525,7 @@ fn row_to_email(r: &rusqlite::Row<'_>) -> rusqlite::Result<EmailRecord> {
 
 fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     let kind: String = r.get(1)?;
-    let status: String = r.get(9)?;
+    let status: String = r.get(10)?;
     Ok(Item {
         id: r.get(0)?,
         kind: ItemKind::parse(&kind).unwrap_or(ItemKind::Todo),
@@ -1282,13 +1535,14 @@ fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         category: r.get(5)?,
         deadline: r.get(6)?,
         remind_at: r.get(7)?,
-        needs_review: r.get::<_, i64>(8)? != 0,
+        remind_policy: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        needs_review: r.get::<_, i64>(9)? != 0,
         status: ItemStatus::parse(&status).unwrap_or(ItemStatus::Active),
-        source_email_id: r.get(10)?,
-        account_id: r.get(11)?,
-        notes: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
+        source_email_id: r.get(11)?,
+        account_id: r.get(12)?,
+        notes: r.get(13)?,
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
     })
 }
 
@@ -1353,7 +1607,111 @@ mod tests {
 
     fn test_db() -> Db {
         let dir = tempfile::tempdir().unwrap();
-        Db::open(dir.path().join("data")).unwrap()
+        Db::open(dir.path().join("data"), None, None).unwrap()
+    }
+
+    #[test]
+    fn seed_defaults_always_inserts_configured_categories() {
+        // 回归：迁移会先插入 career_promo，若种子逻辑仍以“表为空”为条件，
+        // llm.yaml 的分类全集就不会落库（Agent 只能自建分类）。
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = Db::open(data_dir.clone(), None, None).unwrap();
+        // 模拟“表里已有一条迁移插入的分类”
+        db.upsert_category("career_promo", "招聘推广", false, "notification", "builtin")
+            .unwrap();
+        let cfg = crate::config::AppConfig::load(&write_min_config(&dir)).unwrap();
+        db.seed_defaults(&cfg).unwrap();
+        for id in ["todo", "interview", "assessment", "written_test", "notification", "misc"] {
+            assert!(
+                db.get_category(id).unwrap().is_some(),
+                "种子分类 {id} 应存在"
+            );
+        }
+    }
+
+    /// 生成最小可加载的配置目录（llm.yaml + config.yaml），供种子测试使用。
+    fn write_min_config(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let p = dir.path().to_path_buf();
+        std::fs::write(
+            p.join("llm.yaml"),
+            "api_key: k\nbase_url: http://127.0.0.1:1\nmodel: mock\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.join("config.yaml"),
+            "mail:\n  address: a@b.c\n  imap: { host: 127.0.0.1, port: 3143, user: a@b.c, password: p }\n  smtp: { host: 127.0.0.1, port: 3025, user: a@b.c, password: p }\n",
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn splits_legacy_single_database_into_mail_and_todo() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let legacy_path = data_dir.join("mail2.db");
+        // 旧版单库 = 邮件域 + 待办域的表放在同一个文件里
+        {
+            let conn = Connection::open(&legacy_path).unwrap();
+            mail_schema(&conn).unwrap();
+            todo_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO emails (message_id,subject,from_addr,body_text,category,sent_at,received_at,account_id)
+                 VALUES ('m1','测试邮件','a@b.c','正文','notification','2026-09-01T00:00:00+00:00','2026-09-01T01:00:00+00:00',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO items (kind,title,party,event,category,deadline,status,source_email_id,account_id,created_at,updated_at)
+                 VALUES ('todo','面试邀请','某公司','技术面试','interview','2026-09-10T14:00:00+08:00','active',1,1,'2026-09-01T01:00:00+00:00','2026-09-01T01:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories (id,label,create_item,kind,source,created_at)
+                 VALUES ('custom_cat','自定义',0,'notification','llm','2026-09-01T01:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO kv (k,v) VALUES ('last_uid:1','42')", []).unwrap();
+        }
+
+        let db = Db::open(data_dir.clone(), None, None).unwrap();
+
+        // 两个新文件生成，旧文件改名保留
+        assert!(data_dir.join("mail.db").exists(), "应生成 mail.db");
+        assert!(data_dir.join("todo.db").exists(), "应生成 todo.db");
+        assert!(!legacy_path.exists(), "旧库应被改名");
+        assert!(data_dir.join("mail2.db.bak").exists(), "旧库应保留为 .bak");
+
+        // 数据按域落位
+        let emails = db
+            .list_emails(&EmailFilter { limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(emails.len(), 1, "邮件应迁移到 mail.db");
+        let items = db
+            .list_items(&ItemFilter { limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(items.len(), 1, "待办应迁移到 todo.db");
+        assert!(db.get_category("custom_cat").unwrap().is_some(), "分类应迁移到 todo.db");
+        assert_eq!(
+            db.kv_get("last_uid:1").unwrap().as_deref(),
+            Some("42"),
+            "收信游标应在 mail.db"
+        );
+
+        // 再次打开不应重复迁移
+        drop(db);
+        let db2 = Db::open(data_dir, None, None).unwrap();
+        assert_eq!(
+            db2.list_items(&ItemFilter { limit: 10, ..Default::default() })
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1382,12 +1740,14 @@ mod tests {
             .unwrap();
         }
         // 重新打开 → 迁移补列 + 新表；旧数据不受影响
-        let db = Db::open(data_dir).unwrap();
-        let conn = db.conn();
-        assert!(column_exists(&conn, "emails", "sent_at").unwrap());
-        assert!(column_exists(&conn, "emails", "account_id").unwrap());
-        assert!(column_exists(&conn, "items", "account_id").unwrap());
-        let n: i64 = conn
+        let db = Db::open(data_dir.clone(), None, None).unwrap();
+        let conn = db.conns();
+        let mail = &conn.mail;
+        let todo = &conn.todo;
+        assert!(column_exists(mail, "emails", "sent_at").unwrap());
+        assert!(column_exists(mail, "emails", "account_id").unwrap());
+        assert!(column_exists(todo, "items", "account_id").unwrap());
+        let n: i64 = todo
             .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
@@ -1420,8 +1780,9 @@ mod tests {
         let id = db.insert_account(&a).unwrap();
         // 注意：conn() 返回 MutexGuard，须在块内释放，避免跨 db.* 调用自锁死锁
         let stored_imap: String = {
-            let conn = db.conn();
-            conn.query_row("SELECT imap_password FROM accounts WHERE id=?1", [id], |r| r.get(0))
+            let conn = db.conns();
+            conn.mail
+                .query_row("SELECT imap_password FROM accounts WHERE id=?1", [id], |r| r.get(0))
                 .unwrap()
         };
         assert_ne!(stored_imap, raw, "DB 中应存混淆后的密码");
@@ -1458,6 +1819,7 @@ mod tests {
                 category: "todo".into(),
                 deadline: d.map(|s| s.to_string()),
                 remind_at: None,
+                remind_policy: String::new(),
                 needs_review: false,
                 status: ItemStatus::Active,
                 source_email_id: None,
@@ -1553,6 +1915,7 @@ mod tests {
             category: "todo".into(),
             deadline: None,
             remind_at: None,
+            remind_policy: String::new(),
             needs_review: false,
             status: ItemStatus::Active,
             source_email_id: source,

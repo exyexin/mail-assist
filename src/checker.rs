@@ -54,60 +54,76 @@ pub async fn run_check(
                 continue;
             }
         }
-        let remind_at = match notifier::compute_remind_at(
-            &deadline,
-            cfg.reminder.days_before,
-            &cfg.reminder.lead_time,
-            cfg.timezone,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("检查跳过: item={} 提醒时刻计算失败: {e:#}", item.id);
-                continue; // deadline 非法已在提取阶段过滤，这里再兜底
+        // 分级提醒：一个事项可能有多个计划时刻（紧急/失效类：立即 + 截止前 2h）
+        let times = notifier::reminder_times(&item, cfg);
+        if times.is_empty() {
+            debug!("检查跳过: item={} 无提醒计划（无截止时间或时刻非法）", item.id);
+            continue;
+        }
+        // 同一事项避免连发：距上次成功提醒 < 30 分钟则本轮不再发第二封
+        let mut last_sent: Option<DateTime<Local>> = db
+            .list_send_logs(Some(item.id), Some(SendStatus::Sent), 20)?
+            .iter()
+            .filter_map(|l| l.sent_at.as_deref())
+            .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Local))
+            .max();
+        for remind_at in times {
+            let remind_dt = match DateTime::parse_from_rfc3339(&remind_at) {
+                Ok(d) => d.with_timezone(&Local),
+                Err(_) => continue,
+            };
+            if remind_dt > now {
+                debug!("检查跳过: item={} 提醒时刻未到 remind_at={remind_at}", item.id);
+                continue; // 提醒时刻未到
             }
-        };
-        let remind_dt = match DateTime::parse_from_rfc3339(&remind_at) {
-            Ok(d) => d.with_timezone(&Local),
-            Err(_) => continue,
-        };
-        if remind_dt > now {
-            debug!("检查跳过: item={} 提醒时刻未到 remind_at={remind_at}", item.id);
-            continue; // 提醒时刻未到
-        }
-        let (mut log, is_new) = notifier::ensure_reminder_log(db, &item, cfg, &remind_at)?;
-        if is_new {
-            report.missed_compensated += 1;
-            debug!("检查补建提醒记录: item={} remind_at={remind_at}（漏发补偿）", item.id);
-        }
-        if log.status == SendStatus::Sent {
-            debug!("检查跳过: item={} 提醒已成功发送", item.id);
-            continue; // 已成功发送，无需再发
-        }
-        if log.status == SendStatus::Failed {
-            if let Some(next) = &log.next_retry_at {
-                if let Ok(next_dt) = DateTime::parse_from_rfc3339(next) {
-                    if next_dt.with_timezone(&Local) > now {
-                        debug!("检查跳过: item={} 未到重试时间 next_retry_at={next}", item.id);
-                        continue; // 未到 30 分钟重试时间
+            if let Some(prev) = last_sent {
+                if now.signed_duration_since(prev) < chrono::Duration::minutes(30) {
+                    debug!(
+                        "检查跳过: item={} 距上次成功提醒不足 30 分钟（remind_at={remind_at}）",
+                        item.id
+                    );
+                    continue;
+                }
+            }
+            let (mut log, is_new) = notifier::ensure_reminder_log(db, &item, cfg, &remind_at)?;
+            if is_new {
+                report.missed_compensated += 1;
+                debug!("检查补建提醒记录: item={} remind_at={remind_at}（漏发补偿）", item.id);
+            }
+            if log.status == SendStatus::Sent {
+                debug!("检查跳过: item={} 提醒已成功发送", item.id);
+                continue; // 已成功发送，无需再发
+            }
+            if log.status == SendStatus::Failed {
+                if let Some(next) = &log.next_retry_at {
+                    if let Ok(next_dt) = DateTime::parse_from_rfc3339(next) {
+                        if next_dt.with_timezone(&Local) > now {
+                            debug!("检查跳过: item={} 未到重试时间 next_retry_at={next}", item.id);
+                            continue; // 未到 30 分钟重试时间
+                        }
                     }
                 }
             }
-        }
-        // 发送（pending 或到期 failed）
-        log.attempt += 1;
-        info!(
-            "发送提醒: item={} attempt={} remind_at={remind_at} to={}",
-            log.item_id, log.attempt, log.to_addr
-        );
-        notifier::send_log(db, smtp, &mut log, now).await;
-        match log.status {
-            SendStatus::Sent => report.reminders_sent += 1,
-            SendStatus::Failed => report.reminders_failed += 1,
-            SendStatus::Pending => {}
-        }
-        // 可选 webhook（成功发送提醒时同步推送一次）
-        if log.status == SendStatus::Sent && !cfg.reminder.webhook_url.trim().is_empty() {
-            notifier::send_webhook(&cfg.reminder.webhook_url, &log.subject, &log.body).await;
+            // 发送（pending 或到期 failed）
+            log.attempt += 1;
+            info!(
+                "发送提醒: item={} attempt={} remind_at={remind_at} policy={} to={}",
+                log.item_id, log.attempt, item.remind_policy, log.to_addr
+            );
+            notifier::send_log(db, smtp, &mut log, now).await;
+            match log.status {
+                SendStatus::Sent => {
+                    report.reminders_sent += 1;
+                    last_sent = Some(now);
+                }
+                SendStatus::Failed => report.reminders_failed += 1,
+                SendStatus::Pending => {}
+            }
+            // 可选 webhook（成功发送提醒时同步推送一次）
+            if log.status == SendStatus::Sent && !cfg.reminder.webhook_url.trim().is_empty() {
+                notifier::send_webhook(&cfg.reminder.webhook_url, &log.subject, &log.body).await;
+            }
         }
     }
 

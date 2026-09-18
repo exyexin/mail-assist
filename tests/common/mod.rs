@@ -70,6 +70,33 @@ pub fn send_mail_at(
     mailer.send(&email).unwrap();
 }
 
+/// 统计测试邮箱中“未读（\\Seen 未设置）”的邮件数量。
+/// 只取 FLAGS（不取正文），用于验证自动拉取不会把用户的邮件标记成已读。
+pub async fn unseen_count(user: &str) -> usize {
+    use async_imap::Client;
+    use futures_util::TryStreamExt;
+    let tcp = tokio::net::TcpStream::connect(GREENMAIL_IMAP)
+        .await
+        .unwrap();
+    let client = Client::new(tcp);
+    let mut session = client.login(user, "x").await.map_err(|(e, _)| e).unwrap();
+    session.select("INBOX").await.unwrap();
+    let msgs = session.fetch("1:*", "(FLAGS)").await.unwrap();
+    let mut unseen = 0usize;
+    let mut stream = msgs;
+    while let Some(msg) = stream.try_next().await.unwrap() {
+        let seen = msg
+            .flags()
+            .any(|f| matches!(f, async_imap::types::Flag::Seen));
+        if !seen {
+            unseen += 1;
+        }
+    }
+    drop(stream);
+    session.logout().await.ok();
+    unseen
+}
+
 /// 读取测试邮箱全部邮件的 (subject, body, message_id, in_reply_to)。
 pub async fn read_inbox(user: &str) -> Vec<(String, String, String, String)> {
     use async_imap::Client;
@@ -80,7 +107,7 @@ pub async fn read_inbox(user: &str) -> Vec<(String, String, String, String)> {
     let client = Client::new(tcp);
     let mut session = client.login(user, "x").await.map_err(|(e, _)| e).unwrap();
     session.select("INBOX").await.unwrap();
-    let msgs = session.fetch("1:*", "(RFC822)").await.unwrap();
+    let msgs = session.fetch("1:*", "(BODY.PEEK[])").await.unwrap();
     let mut out = Vec::new();
     let mut stream = msgs;
     while let Some(msg) = stream.try_next().await.unwrap() {
@@ -276,6 +303,21 @@ fn mock_classify(user_text: &str) -> &'static str {
 }
 
 fn mock_extract(user_text: &str) -> serde_json::Value {
+    // 测试用：正文里写 `DEADLINE:<RFC3339>` 可让 mock 返回指定截止时间
+    if let Some(rest) = user_text.split("DEADLINE:").nth(1) {
+        let d = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(['。', '，', ',', '.'])
+            .to_string();
+        if chrono::DateTime::parse_from_rfc3339(&d).is_ok() {
+            return serde_json::json!({
+                "party": "字节跳动", "event": "技术面试", "title": "技术面试邀请",
+                "deadline": d, "category": null
+            });
+        }
+    }
     if user_text.contains("没有时间") || user_text.contains("暂无时间") {
         serde_json::json!({"party":"某公司","event":"待定事项","title":"待定事项","deadline":null,"category":null})
     } else if user_text.contains("请在") {

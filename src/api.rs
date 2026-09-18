@@ -214,6 +214,8 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<Resp<Value>>, 
         "listen": c.listen,
         "auth_enabled": !c.auth_token.trim().is_empty(),
         "data_dir": c.data_dir.to_string_lossy(),
+        "mail_db": c.mail_db.to_string_lossy(),
+        "todo_db": c.todo_db.to_string_lossy(),
         "timezone": c.timezone.name(),
         "poll_interval_secs": c.poll_interval_secs,
         "reminder": {
@@ -351,18 +353,8 @@ fn build_item(state: &AppState, p: &ItemPayload, account_id: i64) -> Result<Item
         }
         _ => None,
     };
-    let remind_at = match &deadline {
-        Some(d) => crate::notifier::compute_remind_at(
-            d,
-            state.cfg.reminder.days_before,
-            &state.cfg.reminder.lead_time,
-            state.cfg.timezone,
-        )
-        .ok(),
-        None => None,
-    };
     let now = db::now_str();
-    Ok(Item {
+    let mut item = Item {
         id: 0,
         kind,
         title: if p.title.trim().is_empty() {
@@ -382,7 +374,8 @@ fn build_item(state: &AppState, p: &ItemPayload, account_id: i64) -> Result<Item
             p.category.clone()
         },
         deadline,
-        remind_at,
+        remind_at: None,
+        remind_policy: String::new(),
         needs_review: kind == ItemKind::Todo && p.deadline.as_deref().map(|d| d.trim().is_empty()).unwrap_or(true),
         status: ItemStatus::Active,
         source_email_id: None,
@@ -390,7 +383,14 @@ fn build_item(state: &AppState, p: &ItemPayload, account_id: i64) -> Result<Item
         notes: p.notes.clone(),
         created_at: now.clone(),
         updated_at: now,
-    })
+    };
+    item.remind_policy = crate::notifier::decide_remind_policy(
+        item.deadline.as_deref(),
+        false,
+        &db::now_str(),
+    );
+    item.remind_at = crate::notifier::reminder_times(&item, &state.cfg).into_iter().next();
+    Ok(item)
 }
 
 async fn get_item(
@@ -736,6 +736,19 @@ async fn reclassify(
         .map(|c| c.kind == "todo")
         .unwrap_or(category == crate::model::CATEGORY_TODO);
 
+    // 重分类为“不建项”的分类（通知类/招聘推广）→ 撤销此前误建的事项
+    if !creates || !kind_todo {
+        if let Some(item_id) = email.item_id {
+            if let Ok(Some(it)) = state.db.get_item(item_id) {
+                if it.kind == ItemKind::Todo {
+                    state.db.delete_item(item_id).map_err(db_err)?;
+                    state.db.clear_email_item(id).map_err(db_err)?;
+                    tracing::info!("重分类为 {category}，撤销事项 item={item_id} email={id}");
+                }
+            }
+        }
+    }
+
     let mut updated = false;
     if creates && kind_todo {
         match state
@@ -768,7 +781,7 @@ async fn reclassify(
                     };
                 }
                 let now = db::now_str();
-                let item = Item {
+                let mut item = Item {
                     id: email.item_id.unwrap_or(0),
                     kind: ItemKind::Todo,
                     title: if ex.title.trim().is_empty() {
@@ -780,15 +793,8 @@ async fn reclassify(
                     event: crate::notifier::clamp_event(&ex.event),
                     category: category.clone(),
                     deadline: deadline.clone(),
-                    remind_at: deadline.as_ref().and_then(|d| {
-                        crate::notifier::compute_remind_at(
-                            d,
-                            state.cfg.reminder.days_before,
-                            &state.cfg.reminder.lead_time,
-                            state.cfg.timezone,
-                        )
-                        .ok()
-                    }),
+                    remind_at: None,
+                    remind_policy: String::new(),
                     needs_review: deadline.is_none(),
                     status: ItemStatus::Active,
                     source_email_id: Some(id),
@@ -797,6 +803,14 @@ async fn reclassify(
                     created_at: now.clone(),
                     updated_at: now,
                 };
+                item.remind_policy = crate::notifier::decide_remind_policy(
+                    item.deadline.as_deref(),
+                    false,
+                    &db::now_str(),
+                );
+                item.remind_at = crate::notifier::reminder_times(&item, &state.cfg)
+                    .into_iter()
+                    .next();
                 if item.id > 0 {
                     state.db.update_item(&item).map_err(db_err)?;
                 } else {

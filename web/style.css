@@ -130,6 +130,8 @@ select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
 .badge.interview { background: #34c98e33; color: #5fdca8; }
 .badge.assessment { background: #4f8cff33; color: #7fb0ff; }
 .badge.written_test { background: #f5b54433; color: #ffd27f; }
+.badge.career_promo { background: #8b96ad33; color: #aab4c8; }
+.badge.urgent { background: #f26d6d33; color: #ff9d9d; }
 .badge.active { background: #34c98e33; color: #5fdca8; }
 .badge.completed { background: #4f8cff33; color: #7fb0ff; }
 .badge.silent { background: #8b96ad33; color: #aab4c8; }

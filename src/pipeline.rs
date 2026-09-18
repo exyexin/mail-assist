@@ -265,14 +265,35 @@ pub async fn process_new_mails_opts(
                 }
             }
         }
+        // ---- 2.6 招聘推广守卫（需求 1）：宣讲会/双选会/网申推荐/投递邀请等群发推广，
+        //      一律只做通知、永不建待办（即使正文里带时间、Agent 已建项也撤销） ----
+        if is_promo_email(&email.subject, &email.body_text) {
+            info!(
+                "招聘推广邮件不建待办（重分类为 {}）: email={email_id} category={category} subject={}",
+                crate::model::CATEGORY_CAREER_PROMO,
+                email.subject
+            );
+            category = crate::model::CATEGORY_CAREER_PROMO.to_string();
+            db.update_email_category(email_id, &category)?;
+            if let Ok(Some(item_id)) = db.item_for_email(email_id) {
+                info!("撤销推广邮件误建待办 item={item_id} email={email_id}");
+                let _ = db.delete_item(item_id);
+                let _ = db.clear_email_item(email_id);
+            }
+        }
         db.update_email_category(email_id, &category)?;
         info!("邮件分类完成 email={email_id} category={category}");
 
         // ---- 3. 按分类确保事项存在（Agent 可能已用 create_item 建好） ----
-        ensure_item(db, llm, cfg, email_id, &email, &category, agent_item.as_ref()).await?;
+        let now_ts = clock.now().to_rfc3339();
+        ensure_item(db, llm, cfg, email_id, &email, &category, agent_item.as_ref(), &now_ts).await?;
         // ---- 3.5 Agent 已建项但缺截止时间 → 补推算（bad case A/B/C/D 修复） ----
         if let Ok(Some(item_id)) = db.item_for_email(email_id) {
-            fill_missing_deadline(db, cfg, email_id, &email, item_id)?;
+            fill_missing_deadline(db, cfg, email_id, &email, item_id, &now_ts)?;
+        }
+        // ---- 3.6 同公司同类型合并：以最新邮件为准（需求 4） ----
+        if let Err(e) = merge_duplicate_items(db, cfg, email_id, &email) {
+            warn!("合并重复事项失败（忽略）: email={email_id} err={e:#}");
         }
         if let Ok(Some(_)) = db.item_for_email(email_id) {
             report.items_created += 1;
@@ -311,10 +332,53 @@ pub async fn process_new_mails_opts(
 }
 
 /// 核心待办分类：仅这些分类即使无明确截止时间也创建待办（其余分类须有截止时间）。
-pub const CORE_TODO_CATEGORIES: [&str; 3] = ["interview", "written_test", "assessment"];
+pub const CORE_TODO_CATEGORIES: [&str; 3] = crate::model::CORE_ACTION_CATEGORIES;
+
+/// 招聘推广邮件检测（需求 1：宣讲会/双选会/网申推荐/投递邀请等群发只做通知）：
+/// 命中推广标记，且没有“本人需要行动”的强标记时判为推广。
+///
+/// 强行动标记（命中即不算推广）：面试/笔试/测评邀请、面试时间、考试时间、
+/// 面试/笔试/测评链接、请在 N 小时内完成、预约面试等。
+fn is_promo_email(subject: &str, body: &str) -> bool {
+    const PROMO_SUBJECT: [&str; 20] = [
+        "宣讲会", "空中宣讲", "空宣", "双选会", "招聘会", "网申", "投递邀请", "诚邀您投递",
+        "诚邀你投递", "火热进行中", "启动啦", "邀您畅聊", "智联推荐", "扫码投递", "秋招启动",
+        "专场宣讲", "校园大使", "岗位详情", "招聘启动", "空宣",
+    ];
+    // 正文层：必须是明确的“推广活动”词（网申/校招这类高频词不算）
+    const PROMO_BODY: [&str; 6] = ["宣讲会", "空中宣讲", "双选会", "招聘会", "宣讲时间", "宣讲地点"];
+    const CAMPUS_CONTEXT: [&str; 7] = ["智联招聘", "智联推荐", "校园招聘", "校招", "秋招", "春招", "实习生招聘"];
+    // 状态/反馈类（投递成功、感谢投递、简历已收到…）不是推广，交给反馈守卫或正常分类
+    const STATUS_NOT_PROMO: [&str; 18] = [
+        "投递成功", "感谢投", "已收到", "简历已收到", "申请进度", "应聘反馈", "结果通知",
+        "流程通知", "录用", "offer", "Offer", "测评通知", "欢迎应聘", "应聘", "申请",
+        "感谢关注", "关注并投递", "应聘登记",
+    ];
+    const STRONG_ACTION: [&str; 18] = [
+        "面试邀请", "笔试邀请", "测评邀请", "面试通知", "笔试通知", "面试时间",
+        "考试时间", "面试链接", "笔试链接", "测评链接", "预约面试", "面试登记", "在线笔试",
+        "在线测评", "专业笔试", "邀请你参加面试", "诚邀你参加", "测评邀请",
+    ];
+    // 主题带明确推广词时优先按推广判定；否则状态/反馈类主题（投递成功/已收到/欢迎应聘…）
+    // 即使正文提到宣讲会也不当作推广。
+    let promo_subject = PROMO_SUBJECT.iter().any(|k| subject.contains(k));
+    if !promo_subject && STATUS_NOT_PROMO.iter().any(|k| subject.contains(k)) {
+        return false;
+    }
+    let text = format!("{subject}\n{body}");
+    if STRONG_ACTION.iter().any(|k| text.contains(k)) {
+        return false;
+    }
+    if crate::deadline::match_action_hint(&text).is_some() {
+        return false; // “请在 N 小时内完成”这类明确行动要求
+    }
+    promo_subject
+        || (PROMO_BODY.iter().any(|k| body.contains(k))
+            && CAMPUS_CONTEXT.iter().any(|k| text.contains(k)))
+}
 
 /// 反馈式邮件检测（subject-only，保守启发式）：
-/// 命中反馈标记（问卷/调研/结果/投递成功/感谢信等）且不含预约/时间标记时判为反馈邮件。
+/// 命中反馈标记（问卷/调研/结果/投递成功/感谢信等）且不含“预约/安排一次具体事务”标记时判为反馈邮件。
 /// 供“含面试关键字但并非预约面试”的邮件守卫使用（需求 3）。
 fn is_feedback_email(subject: &str) -> bool {
     const FEEDBACK: [&str; 26] = [
@@ -323,9 +387,11 @@ fn is_feedback_email(subject: &str) -> bool {
         "简历已收到", "简历接收", "申请进度", "进度通知", "流程通知", "筛选通过",
         "通过初筛", "笔试通过", "测评通过", "面试通过", "录用通知", "offer",
     ];
-    const SCHEDULE: [&str; 13] = [
-        "邀请", "预约", "安排", "参加", "确认", "时间", "链接", "报名", "开始",
-        "待办", "提醒", "笔试通知", "面试通知",
+    // 只有“预约/安排一次具体事务”的强标记才推翻反馈判定（原来含“邀请/时间/链接”等宽泛词，
+    // 会把“面试体验问卷邀请”误判为事务类）
+    const SCHEDULE: [&str; 12] = [
+        "预约", "安排面试", "面试邀请", "笔试邀请", "测评邀请", "面试通知", "笔试通知",
+        "测评通知", "面试时间", "考试时间", "笔试时间", "测评时间",
     ];
     let hit = FEEDBACK.iter().any(|k| subject.contains(k));
     if !hit {
@@ -371,22 +437,25 @@ async fn ensure_item(
     email: &EmailRecord,
     category: &str,
     agent_item: Option<&serde_json::Value>,
+    now: &str,
 ) -> Result<()> {
     if db.item_for_email(email_id)?.is_some() {
         return Ok(()); // Agent 已建项（幂等）
     }
     let cat = db.get_category(category)?;
+    let is_core_action = CORE_TODO_CATEGORIES.contains(&category);
     let creates = cat
         .as_ref()
-        .map(|c| c.create_item)
-        .unwrap_or(category == crate::model::CATEGORY_TODO);
+        .map(|c| c.create_item || is_core_action)
+        .unwrap_or(category == crate::model::CATEGORY_TODO || is_core_action);
     if !creates {
+        info!("分类 {category} 不自动建项，跳过 email={email_id}");
         return Ok(());
     }
     let kind_todo = cat
         .as_ref()
         .map(|c| c.kind == "todo")
-        .unwrap_or(category == crate::model::CATEGORY_TODO);
+        .unwrap_or(category == crate::model::CATEGORY_TODO || is_core_action);
     if !kind_todo {
         // 通知类不再自动创建事项（需求 2）
         info!("通知类邮件不创建事项 email={email_id} category={category}");
@@ -445,42 +514,52 @@ async fn ensure_item(
         return Ok(());
     }
 
-    let remind_at = match &deadline {
-        Some(d) => notifier::compute_remind_at(
-            d,
-            cfg.reminder.days_before,
-            &cfg.reminder.lead_time,
-            cfg.timezone,
-        )
-        .ok(),
-        None => None,
-    };
-    let now = db::now_str();
-    let item = Item {
+    // 分类校验：LLM 返回的二级类型必须是已落库的分类 id（需求 2：禁止 label 当 id）
+    let item_category = ex
+        .category
+        .clone()
+        .filter(|c| !c.trim().is_empty() && c.trim() != category)
+        .filter(|c| matches!(db.get_category(c.trim()), Ok(Some(_))))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|| category.to_string());
+    let mut item = Item {
         id: 0,
         kind: ItemKind::Todo,
         title: if ex.title.trim().is_empty() { email.subject.clone() } else { ex.title.clone() },
         party: ex.party.clone(),
         event: notifier::clamp_event(&ex.event),
-        category: ex.category.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| category.to_string()),
+        category: item_category,
         deadline: deadline.clone(),
-        remind_at,
+        remind_at: None,
+        remind_policy: String::new(),
         needs_review: deadline.is_none(),
         status: ItemStatus::Active,
         source_email_id: Some(email_id),
         account_id: email.account_id,
         notes,
-        created_at: now.clone(),
-        updated_at: now,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
     };
+    apply_remind_plan(cfg, &mut item, &text, now);
     let item_id = db.insert_item(&item)?;
     db.set_email_item(email_id, item_id)?;
     info!(
-        "创建事项 item={item_id} category={category} kind={} deadline={:?}",
+        "创建事项 item={item_id} category={} kind={} deadline={:?} remind_policy={}",
+        item.category,
         item.kind.as_str(),
-        deadline
+        deadline,
+        item.remind_policy
     );
     Ok(())
+}
+
+/// 计算提醒策略与最早提醒时刻（分级提醒；链接失效类优先）。
+fn apply_remind_plan(cfg: &AppConfig, item: &mut Item, text: &str, now: &str) {
+    let link_expiry = crate::deadline::match_link_expiry_hint(text).is_some()
+        && crate::deadline::match_action_hint(text).is_none();
+    item.remind_policy =
+        notifier::decide_remind_policy(item.deadline.as_deref(), link_expiry, now);
+    item.remind_at = notifier::reminder_times(item, cfg).into_iter().next();
 }
 
 /// Agent 已建项但无截止时间 → 基于邮件正文补推算（bad case A：Agent 建项后此前跳过推算）。
@@ -490,6 +569,7 @@ fn fill_missing_deadline(
     email_id: i64,
     email: &EmailRecord,
     item_id: i64,
+    now: &str,
 ) -> Result<()> {
     let Some(mut it) = db.get_item(item_id)? else {
         return Ok(());
@@ -512,13 +592,8 @@ fn fill_missing_deadline(
     );
     if let Some(d) = deadline {
         it.deadline = Some(d.clone());
-        it.remind_at = notifier::compute_remind_at(
-            &d,
-            cfg.reminder.days_before,
-            &cfg.reminder.lead_time,
-            cfg.timezone,
-        )
-        .ok();
+        let text_all = format!("{} {}", email.subject, email.body_text);
+        apply_remind_plan(cfg, &mut it, &text_all, now);
         if let Some(n) = dnote {
             it.notes = if it.notes.trim().is_empty() {
                 n
@@ -527,16 +602,201 @@ fn fill_missing_deadline(
             };
         }
         it.needs_review = false;
-        it.updated_at = db::now_str();
+        it.updated_at = now.to_string();
         db.update_item(&it)?;
         info!("Agent 建项后补填截止时间 item={item_id} email={email_id} deadline={d}");
     } else if !it.needs_review {
         // 无截止时间可推算 → 标记“待补截止时间”（Agent 建项默认 needs_review=false）
         it.needs_review = true;
-        it.updated_at = db::now_str();
+        it.updated_at = now.to_string();
         db.update_item(&it)?;
         info!("Agent 建项无截止时间，标记待补 item={item_id} email={email_id}");
     }
+    Ok(())
+}
+
+/// 同公司/同主题重复邮件 → 合并为一条事项，以最新邮件为准（需求 4）。
+///
+/// 合并策略：
+/// - 保留原有事项（保留其发送历史），用最新邮件的信息覆盖标题/事件/截止时间/备注；
+/// - 新事项被删除，两封邮件都指向保留的事项；
+/// - 截止时间变化时清空未发送的提醒记录，由 checker 按新截止时间重建。
+fn merge_duplicate_items(db: &Db, cfg: &AppConfig, email_id: i64, email: &EmailRecord) -> Result<()> {
+    let Some(new_item_id) = db.item_for_email(email_id)? else {
+        return Ok(());
+    };
+    let Some(new_item) = db.get_item(new_item_id)? else {
+        return Ok(());
+    };
+    if new_item.kind != ItemKind::Todo {
+        return Ok(());
+    }
+
+    // (a) 完全重复邮件：同主题 + 同发件人，且旧邮件已有关联事项
+    if let Some(prev_email) =
+        db.find_email_by_subject_from(&email.subject, &email.from_addr, email_id)?
+    {
+        if let Some(prev_item_id) = prev_email.item_id {
+            if prev_item_id != new_item_id {
+                if let Some(prev_item) = db.get_item(prev_item_id)? {
+                    if prev_item.kind == ItemKind::Todo && prev_item.status == ItemStatus::Active {
+                        info!(
+                            "重复邮件合并: email={email_id} → 沿用事项 item={prev_item_id}（同主题同发件人）"
+                        );
+                        return merge_item_into(db, cfg, &prev_item, &new_item, email_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // (b) 同公司 + 同分类：仅当判断为“同一件事”时合并（同一天/±24h、提醒确认邮件、改期通知），
+    //     否则保留为独立事项（例如同公司不同场次的面试）。
+    let party = new_item.party.trim().to_string();
+    if party.is_empty() {
+        return Ok(());
+    }
+    // 公司名做归一化比较（“卓驭”=“深圳市卓驭科技有限公司”），避免同一家公司重复建项
+    let party_key = normalize_party(&party);
+    let candidates: Vec<Item> = db
+        .list_active_todo_items(email.account_id)?
+        .into_iter()
+        .filter(|c| {
+            c.id != new_item_id
+                && c.category == new_item.category
+                && normalize_party(&c.party) == party_key
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let force = ["更新", "变更", "改期", "调整", "取消", "reschedule", "update"]
+        .iter()
+        .any(|k| email.subject.contains(k) || email.body_text.contains(k));
+    let now = chrono::DateTime::parse_from_rfc3339(&crate::db::now_str())
+        .unwrap_or_else(|_| chrono::Utc::now().fixed_offset());
+    if let Some(existing) = pick_merge_target(&candidates, &new_item, cfg, force, now) {
+        info!(
+            "同公司同类型合并: email={email_id} party={party} category={} → 更新事项 item={}（force={force}）",
+            new_item.category, existing.id
+        );
+        return merge_item_into(db, cfg, existing, &new_item, email_id);
+    }
+    Ok(())
+}
+
+/// 公司名归一化：去掉常见后缀与市级前缀，用于“同一家公司”判断。
+fn normalize_party(s: &str) -> String {
+    let mut t = s.trim().to_lowercase().replace([' ', '\u{3000}'], "");
+    for suf in [
+        "集团股份有限公司",
+        "股份有限公司",
+        "有限责任公司",
+        "科技有限公司",
+        "有限公司",
+        "集团",
+        "公司",
+        "科技",
+    ] {
+        if t.len() > suf.len() && t.ends_with(suf) {
+            t.truncate(t.len() - suf.len());
+        }
+    }
+    for pre in ["深圳市", "北京市", "上海市", "广州市", "杭州市", "厦门市", "南京市", "成都市"] {
+        if let Some(rest) = t.strip_prefix(pre) {
+            t = rest.to_string();
+        }
+    }
+    t
+}
+
+/// 选出“同一件事”的既有事项作为合并目标：
+/// - 新事项有截止时间：优先同一天 / ±24h 内的既有事项；其次既有“待补时间”的事项；改期类邮件则合并到最早的一条；
+/// - 新事项无截止时间（提醒/确认邮件）：合并到最近将来到期的事项，否则合并到最新的一条。
+fn pick_merge_target<'a>(
+    candidates: &'a [Item],
+    new: &Item,
+    cfg: &AppConfig,
+    force: bool,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Option<&'a Item> {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match new.deadline.as_deref().and_then(parse) {
+        Some(nd) => {
+            if let Some(t) = candidates
+                .iter()
+                .filter(|c| {
+                    c.deadline
+                        .as_deref()
+                        .and_then(parse)
+                        .map(|cd| {
+                            let same_day = cd.with_timezone(&cfg.timezone).date_naive()
+                                == nd.with_timezone(&cfg.timezone).date_naive();
+                            same_day || (cd - nd).num_hours().abs() <= 24
+                        })
+                        .unwrap_or(false)
+                })
+                .min_by_key(|c| c.id)
+            {
+                return Some(t);
+            }
+            if let Some(t) = candidates
+                .iter()
+                .filter(|c| c.deadline.is_none())
+                .min_by_key(|c| c.id)
+            {
+                return Some(t); // 既有事项待补时间 → 用新邮件补上
+            }
+            if force {
+                return candidates.iter().min_by_key(|c| c.id);
+            }
+            None
+        }
+        None => candidates
+            .iter()
+            .filter_map(|c| c.deadline.as_deref().and_then(parse).map(|d| (d, c)))
+            .filter(|(d, _)| *d >= now)
+            .min_by_key(|(d, _)| *d)
+            .map(|(_, c)| c)
+            .or_else(|| candidates.iter().max_by_key(|c| c.id)),
+    }
+}
+
+/// 把 `new`（最新邮件产生的事项）合并进 `keep`（保留的事项），删除 `new`。
+fn merge_item_into(db: &Db, cfg: &AppConfig, keep: &Item, new: &Item, new_email_id: i64) -> Result<()> {
+    let mut merged = keep.clone();
+    let deadline_changed = merged.deadline != new.deadline;
+    if !new.title.trim().is_empty() {
+        merged.title = new.title.clone();
+    }
+    if !new.event.trim().is_empty() {
+        merged.event = new.event.clone();
+    }
+    if new.deadline.is_some() {
+        merged.deadline = new.deadline.clone();
+        merged.remind_policy = new.remind_policy.clone();
+    }
+    if !new.notes.trim().is_empty() {
+        merged.notes = new.notes.clone();
+    }
+    merged.needs_review = merged.deadline.is_none();
+    merged.source_email_id = Some(new_email_id);
+    merged.updated_at = db::now_str();
+    // 依据合并后的截止时间重算提醒计划
+    merged.remind_at = crate::notifier::reminder_times(&merged, cfg).into_iter().next();
+    db.update_item(&merged)?;
+    if deadline_changed {
+        let n = db.delete_unsent_send_logs(merged.id)?;
+        if n > 0 {
+            info!("合并后截止时间变化，清理未发送提醒 {n} 条 item={}", merged.id);
+        }
+    }
+    db.set_email_item(new_email_id, merged.id)?;
+    db.delete_item(new.id)?;
+    info!(
+        "事项合并完成: 保留 item={} 删除 item={} (email={new_email_id})",
+        merged.id, new.id
+    );
     Ok(())
 }
 
@@ -664,4 +924,89 @@ async fn detect_reply(
         return Ok(None);
     }
     Ok(Some((item_id, intent)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promo_emails_are_detected() {
+        // 智联推荐群发：宣讲会/双选会/网申推荐/投递邀请 → 推广（不建待办）
+        for subject in [
+            "尊敬的孙同学【智联推荐】清原集团 2027 校招・厦门大学站",
+            "尊敬的孙同学【智联推荐】苏星π成长计划—苏州银行2027届校园招聘火热进行中",
+            "孙同学，你有1份算法工程师秋招双选会投递邀请，点击查看，双选会岗位详情>>",
+            "【招商银行温州分行】诚邀您扫码网申投递",
+            "波克 2027秋招空中宣讲会-9/16日-19:00-邀您畅聊未来！",
+        ] {
+            assert!(
+                is_promo_email(subject, "宣讲时间：9月18日 14:30；地点：思明校区"),
+                "应判为推广: {subject}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_action_emails_are_not_promo() {
+        for (subject, body) in [
+            ("【华为公司】诚邀您参加华为公司在线笔试，谢谢！", "考试时间 2026-09-18 09:00"),
+            ("曦望sunrise-笔试邀请", "请务必在收到邮件作答通知后，72 小时内完成作答"),
+            ("字节跳动校园招聘面试邀请 — 系统软件工程师", "视频面试，请提前10分钟调试设备"),
+            ("国家开发银行招聘测评通知", "测评地址：http://x ，需在72小时内完成"),
+            ("【Shopee】校园招聘简历更新邀请", "请于24H内完成简历信息的更新"),
+        ] {
+            assert!(!is_promo_email(subject, body), "不应判为推广: {subject}");
+        }
+    }
+
+    #[test]
+    fn party_normalization_for_merge() {
+        assert_eq!(normalize_party("卓驭科技"), normalize_party("深圳市卓驭科技有限公司"));
+        assert_eq!(normalize_party("京东"), normalize_party("京东集团"));
+        assert_eq!(normalize_party("字节跳动"), "字节跳动");
+        assert_ne!(normalize_party("京东"), normalize_party("百度"));
+    }
+
+    #[test]
+    fn status_mails_are_not_promo() {
+        // 投递成功/感谢投递/申请进度等状态反馈不是“招聘推广”
+        for subject in [
+            "【阿里巴巴校园招聘】投递成功",
+            "感谢您关注并投递寒武纪",
+            "【京东校招】我们已收到你的申请，请及时关注后续进展",
+            "来自Shopee的应聘反馈通知",
+            "国家开发银行招聘测评通知",
+            "欢迎应聘DJI 大疆",
+        ] {
+            assert!(
+                !is_promo_email(subject, "感谢投递，请关注后续校招宣讲会安排。"),
+                "状态类邮件不应判为推广: {subject}"
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_guard_catches_survey_with_invitation_wording() {
+        // “面试体验问卷邀请”是反馈类，不是预约面试
+        assert!(is_feedback_email("快手面试体验问卷邀请"));
+        assert!(is_feedback_email("字节跳动面试体验调研"));
+        assert!(is_feedback_email("面试结果通知"));
+        // 真正的预约/邀请不算反馈
+        assert!(!is_feedback_email("字节跳动校园招聘面试邀请"));
+        assert!(!is_feedback_email("【快手】在线人才测评邀请"));
+    }
+
+    #[test]
+    fn promo_body_only_with_campus_context() {
+        // 正文含“宣讲会”但主题无标记：仅当同时出现校招语境时判推广
+        assert!(is_promo_email(
+            "某公司 2027 届校园招聘",
+            "我们将于9月20日举办宣讲会，欢迎参加。"
+        ));
+        assert!(!is_promo_email(
+            "项目周会纪要",
+            "会上提到下月有一场宣讲会安排。"
+        ));
+    }
 }

@@ -148,6 +148,8 @@ function renderTodos() {
       <td><input type="checkbox" class="row-chk" value="${it.id}"></td>
       <td><strong>${esc(it.event || it.title)}</strong>
           ${it.needs_review ? ' <span class="badge pending">待补截止时间</span>' : ''}
+          ${it.remind_policy === 'urgent' ? ' <span class="badge urgent" title="24h 内截止：收到即提醒 + 截止前 2h">紧急</span>' : ''}
+          ${it.remind_policy === 'link_expiry' ? ' <span class="badge urgent" title="链接/资格失效类：收到即提醒 + 截止前 2h">失效提醒</span>' : ''}
           <div class="small muted">${esc(it.title)}</div>
           ${it.notes ? `<div class="small muted">${esc(it.notes.slice(0, 60))}</div>` : ''}</td>
       <td>${esc(it.party || '—')}</td>

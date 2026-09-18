@@ -7,6 +7,20 @@ pub const CATEGORY_TODO: &str = "todo";
 pub const CATEGORY_NOTIFICATION: &str = "notification";
 pub const CATEGORY_CONVERSATION: &str = "conversation";
 pub const CATEGORY_MISC: &str = "misc";
+/// 招聘推广类（宣讲会/双选会/网申推荐/投递邀请）：只做通知，永不建待办
+pub const CATEGORY_CAREER_PROMO: &str = "career_promo";
+/// 需要本人行动的核心分类：即使没有明确时间也建待办（标记待补截止时间）
+pub const CORE_ACTION_CATEGORIES: [&str; 3] = ["interview", "written_test", "assessment"];
+
+/// 提醒策略（决定 checker 生成哪些提醒时刻）
+pub mod remind_policy {
+    /// 常规：截止前 days_before 天的 lead_time（默认 09:00）
+    pub const NORMAL: &str = "normal";
+    /// 紧急（收到时距截止 ≤24h）：立即提醒 + 截止前 2 小时
+    pub const URGENT: &str = "urgent";
+    /// 链接/资格失效类：立即提醒 + 截止前 2 小时
+    pub const LINK_EXPIRY: &str = "link_expiry";
+}
 
 /// 事务类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +153,10 @@ pub struct Item {
     pub event: String,
     pub category: String,
     pub deadline: Option<String>,  // RFC3339
-    pub remind_at: Option<String>, // RFC3339
+    pub remind_at: Option<String>, // RFC3339（最早一次提醒时刻）
+    /// 提醒策略：normal | urgent | link_expiry（见 [remind_policy]）
+    #[serde(default)]
+    pub remind_policy: String,
     pub needs_review: bool,
     pub status: ItemStatus,
     pub source_email_id: Option<i64>,

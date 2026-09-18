@@ -14,8 +14,110 @@ use chrono_tz::Tz;
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// 相对时限的来源类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintKind {
+    /// “请在 X 小时内完成”这类需要本人行动、时限明确的表达
+    Action,
+    /// “链接 N 小时后失效 / 有效期 N 天”这类资格/链接失效表达（提醒策略：立即提醒）
+    LinkExpiry,
+}
+
+/// 命中的相对时限（含来源类型）。
+#[derive(Debug, Clone, Copy)]
+pub struct RelativeHint {
+    pub dur: Duration,
+    pub kind: HintKind,
+}
+
+/// 命中“链接/资格失效”表达（X 小时后失效、有效期 N 天、expires in N hours 等）。
+pub fn match_link_expiry_hint(text: &str) -> Option<Duration> {
+    static RE_FAIL_CN: OnceLock<Regex> = OnceLock::new();
+    static RE_VALID_CN: OnceLock<Regex> = OnceLock::new();
+    static RE_EN: OnceLock<Regex> = OnceLock::new();
+    let re_fail = RE_FAIL_CN.get_or_init(|| {
+        Regex::new(
+            r"(\d{1,3})\s*(?:个)?\s*(?:小时|钟头|h|H|hr|HR|hours?)\s*(?:之?后|以?内)?\s*(?:将)?\s*(?:失效|过期|作废|关闭|自动失效|过期作废)",
+        )
+        .unwrap()
+    });
+    let re_valid = RE_VALID_CN.get_or_init(|| {
+        Regex::new(
+            r"(?:链接|二维码|资格|有效期|凭证|验证码)[^。\n；;]{0,40}?(?:有效期[为是]?|将在?|将于|有效)\s*(\d{1,3})\s*(?:个)?\s*(小时|钟头|天|日|h|H|hours?|days?)",
+        )
+        .unwrap()
+    });
+    let re_en = RE_EN.get_or_init(|| {
+        Regex::new(
+            r"(?:expires?|valid)\s+(?:in|for|within)\s+(\d{1,3})\s*(hours?|days?)",
+        )
+        .unwrap()
+    });
+
+    let to_dur = |n: i64, unit: &str| -> Option<Duration> {
+        if n <= 0 || n > 24 * 30 {
+            return None;
+        }
+        let u = unit.to_lowercase();
+        if u.contains('天') || u.contains('日') || u.starts_with("day") {
+            if n <= 90 {
+                Some(Duration::days(n))
+            } else {
+                None
+            }
+        } else {
+            Some(Duration::hours(n))
+        }
+    };
+
+    if let Some(caps) = re_fail.captures(text) {
+        if let Ok(n) = caps[1].parse::<i64>() {
+            if let Some(d) = to_dur(n, "小时") {
+                return Some(d);
+            }
+        }
+    }
+    if let Some(caps) = re_valid.captures(text) {
+        if let Ok(n) = caps[1].parse::<i64>() {
+            let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("小时");
+            if let Some(d) = to_dur(n, unit) {
+                return Some(d);
+            }
+        }
+    }
+    if let Some(caps) = re_en.captures(text) {
+        if let Ok(n) = caps[1].parse::<i64>() {
+            let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("hours");
+            if let Some(d) = to_dur(n, unit) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// 命中相对时限表达（x 日 / 24/48/72 小时 / 24H / within N hours|days + 动作词），
+/// 或“链接 N 小时后失效 / 有效期 N 天”这类失效表达；返回时限与来源类型。
+pub fn match_relative_hint_kind(text: &str) -> Option<RelativeHint> {
+    if let Some(dur) = match_action_hint(text) {
+        return Some(RelativeHint {
+            dur,
+            kind: HintKind::Action,
+        });
+    }
+    match_link_expiry_hint(text).map(|dur| RelativeHint {
+        dur,
+        kind: HintKind::LinkExpiry,
+    })
+}
+
 /// 命中相对时限表达（x 日 / 24/48/72 小时 / 24H / within N hours|days + 动作词），返回该时限。
 pub fn match_relative_hint(text: &str) -> Option<Duration> {
+    match_action_hint(text).or_else(|| match_link_expiry_hint(text))
+}
+
+/// 需要本人行动的相对时限表达（“请在 24H 内完成”“7 个工作日内回复”等）。
+pub fn match_action_hint(text: &str) -> Option<Duration> {
     // "请在3日内完成" / "请于7个工作日内回复" / "24H内完成" / "within 48 hours" 等
     static RE_DAYS: OnceLock<Regex> = OnceLock::new();
     static RE_HOURS: OnceLock<Regex> = OnceLock::new();
@@ -285,6 +387,33 @@ pub fn infer_deadline(
     if let Some(d) = existing {
         let d = d.trim().to_string();
         if !d.is_empty() && DateTime::parse_from_rfc3339(&d).is_ok() {
+            // LLM 直接给 RFC3339：若正文没有明确时间、且该值与“发件/收件时间 + 相对时限”
+            // 的确定性推算接近，则判定模型算的是同一个相对时限，以确定性推算为准。
+            // （真实案例：模型把提示词里的 UTC 墙钟时间当成本地时间，导致 72 小时时限偏早 8 小时。）
+            if let (Some(det), Some(hint)) = (
+                infer_relative_deadline(body, sent_at, received_at, tz),
+                match_relative_hint_kind(body),
+            ) {
+                if parse_human_datetime(body, tz).is_none() {
+                    if let (Ok(a), Ok(b)) = (
+                        DateTime::parse_from_rfc3339(&d),
+                        DateTime::parse_from_rfc3339(&det),
+                    ) {
+                        let diff = (a - b).num_minutes().abs();
+                        if diff > 1 && diff <= (hint.dur.num_minutes() / 2).max(30) {
+                            return (
+                                Some(det.clone()),
+                                Some(format!(
+                                    "【纠正】按正文时限表达“{}”＋发件时间确定性推算为 {}（模型给出的相对时间偏差 {} 分钟，已纠正）",
+                                    crate::deadline::truncate_hint(body),
+                                    b.with_timezone(&Utc).format("%Y-%m-%d %H:%M"),
+                                    (a - b).num_minutes()
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
             return (Some(d), None);
         }
         // LLM 给出的非 RFC3339 明确时间（如 "2026-04-24 11:00"）尝试归一化
@@ -356,6 +485,56 @@ fn build_datetime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_link_expiry_hints() {
+        use super::*;
+        let h = match_link_expiry_hint("你可以点击下方链接自助选择时间（链接将于 24 小时后失效，请尽快操作）")
+            .expect("应识别 24 小时后失效");
+        assert_eq!(h, Duration::hours(24));
+        let k = match_relative_hint_kind("测评链接有效期72小时，请尽快完成")
+            .expect("应识别有效期 72 小时");
+        assert_eq!(k.kind, HintKind::LinkExpiry);
+        assert_eq!(k.dur, Duration::hours(72));
+        assert_eq!(
+            match_link_expiry_hint("This link expires in 48 hours").unwrap(),
+            Duration::hours(48)
+        );
+        // “N 小时后失效”不应被当成行动类时限
+        assert!(match_action_hint("链接将于 24 小时后失效").is_none());
+    }
+
+    #[test]
+    fn reconciles_llm_relative_deadline_offset() {
+        use super::*;
+        let body = "请务必在收到邮件作答通知后，72 小时内完成作答。";
+        let sent = Some("2026-09-07T10:29:27+00:00");
+        // 模型把 UTC 墙钟当本地时间：2026-09-10T10:29:27+08:00（实际早 8 小时）
+        let (d, note) = infer_deadline(
+            body,
+            Some("2026-09-10T10:29:27+08:00".to_string()),
+            sent,
+            None,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(d.as_deref(), Some("2026-09-10T10:29:27+00:00"));
+        assert!(note.unwrap_or_default().contains("纠正"));
+    }
+
+    #[test]
+    fn keeps_llm_deadline_when_body_has_explicit_time() {
+        use super::*;
+        // 正文有明确时间 → 不做相对时限纠偏（明确时间优先）
+        let body = "面试时间：2026-09-16 15:00，如需改期请提前 24 小时联系 HR。";
+        let (d, _) = infer_deadline(
+            body,
+            Some("2026-09-16T15:00:00+08:00".to_string()),
+            Some("2026-09-14T07:45:02+00:00"),
+            None,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(d.as_deref(), Some("2026-09-16T15:00:00+08:00"));
+    }
 
     #[test]
     fn matches_day_hints() {

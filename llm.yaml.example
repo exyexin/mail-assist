@@ -14,16 +14,18 @@ agent:
   max_tool_rounds: 8
 
 # 邮件分类类型（可增删改；id 用于内部标识，label 用于提醒主题【类型/...】与界面展示）
-# create_item: true 表示该类邮件自动创建事务（item），进入待办/通知管理
-# 注意：通知类（投递成功/问卷/结果通知等反馈式邮件）不建事项，create_item 必须为 false；
-# 待办仅自动创建于 面试/笔试/测评 三类，以及含明确截止时间（如“请在24H内完成”）的邮件。
-# 运行期分类存于数据库：Agent 可用 create_category 工具自主新增（如 线上测评），
-# 也可在 Web 待办页新建事项时手工新增；此处为首次启动的种子分类。
+# create_item: true 表示该类邮件自动创建事务（item），进入待办管理
+# 待办口径：只有「需要本人亲自行动且有明确时间」的邮件才建待办——
+#   面试/笔试/测评/预约/材料提交 等；宣讲会/双选会/网申推荐/投递邀请属于招聘推广
+#   （career_promo），只做通知、永不建待办。
+# 注意：Agent 运行期新建的分类默认 create_item=false（需要建项时由 Agent 显式调用 create_item）。
+# 运行期分类存于数据库；此处为首次启动的种子分类。
 categories:
   - { id: todo,          label: "事务预约/待办", create_item: true }
   - { id: interview,     label: "面试",         create_item: true }
   - { id: assessment,    label: "测评",         create_item: true }
   - { id: written_test,  label: "笔试",         create_item: true }
   - { id: notification,  label: "通知类",       create_item: false }
+  - { id: career_promo,  label: "招聘推广",     create_item: false }
   - { id: conversation,  label: "对话交流型",   create_item: false }
   - { id: misc,          label: "其他",         create_item: false }

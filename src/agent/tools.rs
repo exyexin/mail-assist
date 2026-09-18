@@ -267,15 +267,15 @@ impl ToolDef for CreateCategoryTool {
         "create_category"
     }
     fn description(&self) -> &'static str {
-        "新增邮件分类（如 线上测评、宣讲会）。id 用小写字母/数字/下划线（1-32 字符）。已存在则返回已有分类，不会报错。"
+        "新增邮件分类（如 线上测评、材料提交）。id 用小写字母/数字/下划线（1-32 字符）。新建分类默认不自动建项（create_item=false），需要建待办时请显式调用 create_item。已存在则返回已有分类，不会报错。"
     }
     fn parameters(&self) -> Value {
         obj_schema(
             json!({
                 "id": { "type": "string", "description": "分类 id，如 online_assessment" },
                 "label": { "type": "string", "description": "显示名称，如 线上测评" },
-                "create_item": { "type": "boolean", "description": "该分类邮件是否自动创建事项，默认 true" },
-                "kind": { "type": "string", "description": "事务类型 todo（有截止时间的待办）或 notification（普通通知），默认 todo" },
+                "create_item": { "type": "boolean", "description": "该分类邮件是否自动创建事项，默认 false（新建分类不建项）" },
+                "kind": { "type": "string", "description": "事务类型 todo（有截止时间的待办）或 notification（普通通知），默认 notification" },
             }),
             vec!["id", "label"],
         )
@@ -296,13 +296,16 @@ impl ToolDef for CreateCategoryTool {
         {
             return ToolResult::err("invalid_args", "id 需为 1-32 位小写字母/数字/下划线/连字符");
         }
-        let kind = jstr(&args, "kind").unwrap_or_else(|| "todo".into());
+        let kind = jstr(&args, "kind").unwrap_or_else(|| "notification".into());
         if kind != "todo" && kind != "notification" {
             return ToolResult::err("invalid_args", "kind 只能为 todo 或 notification");
         }
+        // 需求 2：Agent 新建的分类默认不自动建项（create_item 默认 false）；
+        // 即使显式传 true，也必须是 kind=todo 的分类，避免推广/通知类分类自动产生待办。
+        let create_item = jbool(&args, "create_item", false) && kind == "todo";
         match ctx
             .db
-            .upsert_category(&id, &label, jbool(&args, "create_item", true), &kind, "llm")
+            .upsert_category(&id, &label, create_item, &kind, "llm")
         {
             Ok(created) => {
                 let c = ctx.db.get_category(&id).ok().flatten();
@@ -379,8 +382,8 @@ impl ToolDef for CreateItemTool {
                 }
             }
         }
-        let now = crate::db::now_str();
-        let item = Item {
+        let now = ctx.clock.now().to_rfc3339();
+        let mut item = Item {
             id: 0,
             kind: if cat.kind == "notification" {
                 ItemKind::Notification
@@ -391,15 +394,8 @@ impl ToolDef for CreateItemTool {
             party: jstr(&args, "party").unwrap_or_default(),
             event: notifier::clamp_event(&jstr(&args, "event").unwrap_or_default()),
             category: category.clone(),
-            remind_at: deadline.as_deref().and_then(|d| {
-                notifier::compute_remind_at(
-                    d,
-                    ctx.cfg.reminder.days_before,
-                    &ctx.cfg.reminder.lead_time,
-                    ctx.cfg.timezone,
-                )
-                .ok()
-            }),
+            remind_at: None,
+            remind_policy: String::new(),
             deadline,
             needs_review: false,
             status: ItemStatus::Active,
@@ -407,8 +403,22 @@ impl ToolDef for CreateItemTool {
             account_id: ctx.account_id,
             notes: jstr(&args, "notes").unwrap_or_default(),
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
         };
+        // 分级提醒策略：链接失效类/24h 内紧急 → 立即提醒 + 截止前 2h
+        let text = ctx
+            .source_email_id
+            .and_then(|eid| ctx.db.get_email(eid).ok().flatten())
+            .map(|e| format!("{} {}", e.subject, e.body_text))
+            .unwrap_or_default();
+        let link_expiry = crate::deadline::match_link_expiry_hint(&text).is_some()
+            && crate::deadline::match_action_hint(&text).is_none();
+        item.remind_policy = notifier::decide_remind_policy(
+            item.deadline.as_deref(),
+            link_expiry,
+            &now,
+        );
+        item.remind_at = notifier::reminder_times(&item, ctx.cfg).into_iter().next();
         match ctx.db.insert_item(&item) {
             Ok(id) => {
                 if let Some(sid) = ctx.source_email_id {
@@ -530,15 +540,12 @@ impl ToolDef for UpdateItemTool {
                 None => return ToolResult::err("invalid_args", format!("非法 status: {s}")),
             }
         }
-        item.remind_at = item.deadline.as_deref().and_then(|d| {
-            notifier::compute_remind_at(
-                d,
-                ctx.cfg.reminder.days_before,
-                &ctx.cfg.reminder.lead_time,
-                ctx.cfg.timezone,
-            )
-            .ok()
-        });
+        item.remind_policy = notifier::decide_remind_policy(
+            item.deadline.as_deref(),
+            item.remind_policy == crate::model::remind_policy::LINK_EXPIRY,
+            &ctx.clock.now().to_rfc3339(),
+        );
+        item.remind_at = notifier::reminder_times(&item, ctx.cfg).into_iter().next();
         item.needs_review = item.kind == ItemKind::Todo && item.deadline.is_none() && item.needs_review;
         item.updated_at = crate::db::now_str();
         match ctx.db.update_item(&item) {

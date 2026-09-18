@@ -242,6 +242,7 @@ async fn e2e_failed_send_retries_after_30_minutes() {
         category: "todo".into(),
         deadline: Some("2027-09-10T14:00:00+08:00".into()),
         remind_at: Some("2027-09-09T01:00:00+00:00".into()),
+        remind_policy: String::new(),
         needs_review: false,
         status: ItemStatus::Active,
         source_email_id: None,
@@ -740,6 +741,7 @@ async fn e2e_agent_mutate_requires_approval_and_replay() {
         category: "todo".into(),
         deadline: Some("2027-09-10T14:00:00+08:00".into()),
         remind_at: None,
+        remind_policy: String::new(),
         needs_review: false,
         status: ItemStatus::Active,
         source_email_id: None,
@@ -1547,7 +1549,11 @@ async fn e2e_reclassify_to_notification_no_item() {
         .db
         .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
         .unwrap();
-    assert_eq!(items_after.len(), 1, "事项数量不应变化（不新建通知事项）");
+    assert_eq!(
+        items_after.len(),
+        0,
+        "重分类为通知类应撤销此前误建的待办（通知类不保留事项）"
+    );
 
     mock.stop();
 }
@@ -1717,6 +1723,7 @@ async fn e2e_items_sorted_by_email_received_time() {
             category: "todo".into(),
             deadline: None,
             remind_at: None,
+            remind_policy: String::new(),
             needs_review: false,
             status: ItemStatus::Active,
             source_email_id: None,
@@ -1744,6 +1751,461 @@ async fn e2e_items_sorted_by_email_received_time() {
     assert!(items[0].source_email_id.is_some());
     assert!(items[1].source_email_id.is_some());
     assert_eq!(items[2].id, manual);
+
+    mock.stop();
+}
+
+/// 需求 1（待办口径）：宣讲会/双选会/网申推荐/投递邀请等招聘推广邮件只做通知、不建待办。
+#[tokio::test]
+async fn e2e_promo_email_no_item() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    // 正文含“会议”会让 mock 归为 todo 并给出 deadline（模拟 Agent 误判为事务）
+    send_mail(
+        "campus@mailf.wisdomore.com",
+        &user,
+        "尊敬的孙同学【智联推荐】清原集团 2027 校招・厦门大学站",
+        "宣讲会时间：2027-09-20 19:10；地点：厦门大学翔安校区；欢迎参加项目评审会。",
+        Some("<e2e-promo-1@wisdomore.com>"),
+        None,
+    );
+    send_mail(
+        "campus@mailf.wisdomore.com",
+        &user,
+        "孙同学，你有1份算法工程师秋招双选会投递邀请，双选会岗位详情>>",
+        "双选会报名时间：2027年8月1日至9月30日，点击查看岗位详情。",
+        Some("<e2e-promo-2@wisdomore.com>"),
+        None,
+    );
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let emails = app
+        .db
+        .list_emails(&mail2::db::EmailFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(emails.len(), 2);
+    for e in &emails {
+        assert_eq!(
+            e.category, "career_promo",
+            "招聘推广邮件应归为 career_promo: {}",
+            e.subject
+        );
+    }
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(items.len(), 0, "招聘推广邮件不得创建待办");
+
+    mock.stop();
+}
+
+/// 需求 1：即使 Agent 已经用 create_item 建了待办，推广守卫也要撤销。
+#[tokio::test]
+async fn e2e_promo_guard_revokes_agent_item() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    // REQ_CREATE_ITEM 使 mock Agent 调用 create_item（deadline=null）
+    send_mail(
+        "campus@mailf.wisdomore.com",
+        &user,
+        "【智联推荐】某银行2027届秋季校园招聘宣讲会火热进行中",
+        "宣讲会时间：2027-09-20 19:10。REQ_CREATE_ITEM",
+        Some("<e2e-promo-revoke@wisdomore.com>"),
+        None,
+    );
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(items.len(), 0, "Agent 误建的推广待办应被撤销");
+
+    mock.stop();
+}
+
+/// 需求 4：完全重复的邮件（同主题同发件人）只保留一条事项，两封邮件都指向它。
+#[tokio::test]
+async fn e2e_duplicate_emails_merge_into_one_item() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    for mid in ["<e2e-dup-1@nowcoder.net>", "<e2e-dup-2@nowcoder.net>"] {
+        send_mail(
+            "support@batchmail.nowcoder.net",
+            &user,
+            "京东集团邀请你参加在线笔试",
+            "考试时间 2027-09-05 19:00-21:00（北京时间），请提前调试设备。",
+            Some(mid),
+            None,
+        );
+    }
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let emails = app
+        .db
+        .list_emails(&mail2::db::EmailFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(emails.len(), 2);
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(items.len(), 1, "重复邮件只应保留一条待办");
+    let ids: Vec<i64> = emails.iter().filter_map(|e| e.item_id).collect();
+    assert_eq!(ids.len(), 2, "两封邮件都应关联到事项");
+    assert_eq!(ids[0], ids[1], "两封重复邮件应指向同一事项");
+
+    mock.stop();
+}
+
+/// 需求 4：同公司同类型（面试）的多封邮件合并为一条，以最新邮件为准。
+#[tokio::test]
+async fn e2e_same_company_same_type_merged() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    send_mail_at(
+        "nio.talent@mail.feishu.cn",
+        &user,
+        "【NIO蔚来】邀请你预约校招面试时间",
+        "请点击链接自助预约视频面试时间。",
+        Some("<e2e-merge-1@nio.com>"),
+        None,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2027-09-01T01:00:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ),
+    );
+    send_mail_at(
+        "nio.talent@mail.feishu.cn",
+        &user,
+        "【NIO蔚来】诚邀你参加校招-大模型推理框架工程师面试",
+        "面试时间：2027-09-10 14:00（北京时间）。请提前10分钟调试设备。",
+        Some("<e2e-merge-2@nio.com>"),
+        None,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2027-09-02T01:00:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ),
+    );
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "同公司同类型（面试）应合并为一条待办: {:?}",
+        items
+            .iter()
+            .map(|i| format!("{}|{}|{}|{:?}", i.party, i.category, i.event, i.deadline))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(items[0].party, "字节跳动"); // mock LLM 固定返回该 party
+    assert!(
+        items[0].source_email_id.is_some(),
+        "合并后应指向最新来源邮件"
+    );
+
+    mock.stop();
+}
+
+/// 需求 3（分级提醒）：24h 内紧急 → 收到即提醒 + 截止前 2h（两条提醒计划）。
+#[tokio::test]
+async fn e2e_urgent_short_deadline_graded_reminders() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    send_mail_at(
+        "hr@shopee.com",
+        &user,
+        "曦望sunrise-笔试邀请",
+        "请务必在收到邮件作答通知后，24 小时内完成作答。",
+        Some("<e2e-urgent-1@nowcoder.net>"),
+        None,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2027-09-01T02:00:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ),
+    );
+
+    let report = mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(items.len(), 1, "含 24H 内完成的邮件应建待办");
+    let item = &items[0];
+    assert_eq!(
+        item.remind_policy,
+        mail2::model::remind_policy::URGENT,
+        "24h 内截止应为紧急提醒策略"
+    );
+    // 截止 = 发件 2027-09-01T02:00Z + 24h = 2027-09-02T02:00Z
+    assert_eq!(item.deadline.as_deref(), Some("2027-09-02T02:00:00+00:00"));
+    // 立即提醒应已在本次收信后的检查中发出
+    assert_eq!(report.reminders_sent, 1, "收到即提醒应已发送");
+    let logs = app.db.list_send_logs(Some(item.id), None, 10).unwrap();
+    assert_eq!(logs.len(), 1, "此刻只应发出“收到即提醒”一条");
+    assert_eq!(logs[0].status, SendStatus::Sent);
+
+    // 推进到截止前 2 小时 → 第二次（临期）提醒发出
+    clock.set(
+        chrono::DateTime::parse_from_rfc3339("2027-09-02T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local),
+    );
+    let r2 = mail2::checker::run_check(
+        &app.db,
+        &app.smtp,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r2.reminders_sent, 1, "截止前 2h 应发出第二次提醒");
+    let logs = app.db.list_send_logs(Some(item.id), None, 10).unwrap();
+    assert_eq!(logs.len(), 2, "紧急事项应有两次提醒（立即 + 截止前 2h）");
+
+    mock.stop();
+}
+
+/// 需求 3：链接失效类（“链接将于 24 小时后失效”）→ 识别为截止时间并立即提醒。
+#[tokio::test]
+async fn e2e_link_expiry_immediate_reminder() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    send_mail_at(
+        "nio.talent@mail.feishu.cn",
+        &user,
+        "【NIO蔚来】邀请你预约校招面试时间",
+        "请在收到本邮件后尽快自助选择面试时间（链接将于 24 小时后失效，请尽快操作）。",
+        Some("<e2e-link-expiry@nio.com>"),
+        None,
+        Some(
+            chrono::DateTime::parse_from_rfc3339("2027-09-01T02:00:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ),
+    );
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(
+        item.deadline.as_deref(),
+        Some("2027-09-02T02:00:00+00:00"),
+        "24 小时后失效应推算为截止时间"
+    );
+    assert_eq!(
+        item.remind_policy,
+        mail2::model::remind_policy::LINK_EXPIRY,
+        "链接失效类应为立即提醒策略"
+    );
+    assert_eq!(item.needs_review, false, "失效类不应再标记待补截止时间");
+
+    mock.stop();
+}
+
+/// 需求 4：同公司但不同场次（截止时间相差 >24h）的面试保留为独立待办；
+/// 同一场次的“面试提醒”邮件则合并进既有待办。
+#[tokio::test]
+async fn e2e_same_company_different_events_not_merged() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    for (mid, subject, dl) in [
+        ("<e2e-2events-1@bytedance.com>", "字节跳动面试邀约（第一场）", "2027-09-10T14:00:00+08:00"),
+        ("<e2e-2events-2@bytedance.com>", "字节跳动面试邀约（第二场）", "2027-09-20T14:00:00+08:00"),
+        // 同一场次的提醒邮件（同一天）→ 应合并进第二场
+        ("<e2e-2events-3@bytedance.com>", "字节跳动面试提醒", "2027-09-20T14:00:00+08:00"),
+    ] {
+        send_mail(
+            "people@mail.bytedance.net",
+            &user,
+            subject,
+            &format!("面试时间见正文。DEADLINE:{dl}"),
+            Some(mid),
+            None,
+        );
+    }
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    let items = app
+        .db
+        .list_items(&mail2::db::ItemFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    let mut dls: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.deadline.clone())
+        .collect();
+    dls.sort();
+    assert_eq!(
+        dls,
+        vec![
+            "2027-09-10T14:00:00+08:00".to_string(),
+            "2027-09-20T14:00:00+08:00".to_string()
+        ],
+        "不同场次面试应保留为两条待办，同场次提醒应合并"
+    );
+
+    mock.stop();
+}
+
+/// 回归：自动拉取必须用 BODY.PEEK[]，不得把用户邮箱里的邮件标记为已读（\Seen）。
+#[tokio::test]
+async fn e2e_fetch_does_not_mark_mail_as_seen() {
+    ensure_greenmail();
+    let user = unique_user();
+    let mock = MockLlmServer::start().await;
+    let dir = temp_config(&mock.base_url, &user, GREENMAIL_SMTP.1);
+    let clock = fake_clock(2027, 9, 1, 10, 0);
+    let app = build_app(&dir, clock.clone(), None);
+
+    send_mail(
+        "hr@example.com",
+        &user,
+        "字节跳动校园招聘面试邀请",
+        "面试时间：2027-09-10 14:00（北京时间）。",
+        Some("<e2e-unseen-1@bytedance.com>"),
+        None,
+    );
+    assert_eq!(common::unseen_count(&user).await, 1, "投递后应为未读");
+
+    mail2::pipeline::process_new_mails(
+        &app.db,
+        &mail2::mail::ImapClient::from_config(&app.cfg.mail.imap),
+        &app.smtp,
+        &app.llm,
+        &app.cfg,
+        app.clock.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    // 拉取并分类后，邮箱中该邮件仍应保持未读
+    assert_eq!(
+        common::unseen_count(&user).await,
+        1,
+        "自动拉取不得把邮件标记为已读（应使用 BODY.PEEK[]）"
+    );
+    let emails = app
+        .db
+        .list_emails(&mail2::db::EmailFilter { limit: 10, ..Default::default() })
+        .unwrap();
+    assert_eq!(emails.len(), 1, "邮件内容仍应正常入库");
 
     mock.stop();
 }

@@ -133,6 +133,11 @@ fn default_categories() -> Vec<CategoryDef> {
             create_item: false,
         },
         CategoryDef {
+            id: "career_promo".into(),
+            label: "招聘推广".into(),
+            create_item: false,
+        },
+        CategoryDef {
             id: "conversation".into(),
             label: "对话交流型".into(),
             create_item: false,
@@ -154,6 +159,12 @@ pub struct YamlConfig {
     pub auth_token: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// 邮件库路径（留空 = <data_dir>/mail.db）
+    #[serde(default)]
+    pub mail_db: String,
+    /// 待办库路径（留空 = <data_dir>/todo.db）
+    #[serde(default)]
+    pub todo_db: String,
     #[serde(default)]
     pub timezone: String,
     #[serde(default = "default_poll_interval")]
@@ -201,6 +212,8 @@ impl Default for YamlConfig {
             listen: default_listen(),
             auth_token: String::new(),
             data_dir: default_data_dir(),
+            mail_db: String::new(),
+            todo_db: String::new(),
             timezone: String::new(),
             poll_interval_secs: default_poll_interval(),
             reminder: ReminderConfig::default(),
@@ -216,6 +229,10 @@ pub struct AppConfig {
     pub listen: String,
     pub auth_token: String,
     pub data_dir: PathBuf,
+    /// 邮件库路径（emails/accounts/agent_runs/kv）
+    pub mail_db: PathBuf,
+    /// 待办库路径（items/send_log/approvals/categories）
+    pub todo_db: PathBuf,
     pub timezone: chrono_tz::Tz,
     pub poll_interval_secs: u64,
     pub reminder: ReminderConfig,
@@ -300,10 +317,22 @@ impl AppConfig {
         };
 
         let data_dir = PathBuf::from(&yc.data_dir);
+        let mail_db = if yc.mail_db.trim().is_empty() {
+            data_dir.join("mail.db")
+        } else {
+            PathBuf::from(yc.mail_db.trim())
+        };
+        let todo_db = if yc.todo_db.trim().is_empty() {
+            data_dir.join("todo.db")
+        } else {
+            PathBuf::from(yc.todo_db.trim())
+        };
         Ok(AppConfig {
             listen: yc.listen,
             auth_token: yc.auth_token,
             data_dir,
+            mail_db,
+            todo_db,
             timezone,
             poll_interval_secs: yc.poll_interval_secs.max(5),
             reminder: yc.reminder,

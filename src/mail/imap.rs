@@ -127,8 +127,10 @@ impl ImapClient {
             None => "1:*".to_string(),
         };
         tracing::debug!("发起 IMAP UID FETCH 范围 {seq}（since_uid={since_uid:?}）");
+        // 必须用 BODY.PEEK[]：`RFC822` / `BODY[]` 会隐式设置 \Seen（把用户邮箱里的未读邮件标成已读）。
+        // BODY.PEEK[] 只读取内容、不改任何标志位。
         let msgs = session
-            .uid_fetch(seq, "(RFC822)")
+            .uid_fetch(seq, "(BODY.PEEK[])")
             .await
             .map_err(|e| anyhow::anyhow!("IMAP UID FETCH 失败: {e}"))?;
 

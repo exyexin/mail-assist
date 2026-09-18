@@ -42,7 +42,11 @@ impl App {
         cfg: config::AppConfig,
         clock: std::sync::Arc<dyn clock::Clock>,
     ) -> anyhow::Result<App> {
-        let db = db::Db::open(cfg.data_dir.clone())?;
+        let db = db::Db::open(
+            cfg.data_dir.clone(),
+            Some(cfg.mail_db.clone()),
+            Some(cfg.todo_db.clone()),
+        )?;
         db.seed_defaults(&cfg)?;
         let smtp = mail::SmtpClient::from_config(&cfg.mail.smtp, &cfg.mail.address)?;
         let llm = llm::LlmClient::new(&cfg.llm)?;

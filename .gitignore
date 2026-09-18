@@ -2,12 +2,18 @@
 config
 config.yaml
 llm.yaml
+# 邮箱服务商导出的配置文本（含客户端专用密码）
+mail_info
+mail-info*
+*_info.txt
 
 # 运行数据
 data/
+snapshots/
 *.db
 *.db-wal
 *.db-shm
+*.db.bak
 
 # 构建产物
 target/

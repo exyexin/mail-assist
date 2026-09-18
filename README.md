@@ -7,24 +7,36 @@
 1. **收发邮件**：IMAP（SSL 993 / 明文）收信 + SMTP（SSL 465 / STARTTLS 587 / 明文）发信。
 2. **DeepSeek 分类**：每封新邮件调用 LLM 分类：
    - 事务预约/待办（`todo`）
+   - 面试 / 笔试 / 测评（`interview` / `written_test` / `assessment`）
    - 通知类（`notification`，含投递成功/问卷调研/结果通知等反馈式邮件）
-   - 对话交流型（`conversation`）
-   - 其他（`misc`）
-   - 类型可在 `llm.yaml` 中增删改（`{更多类型}` 可扩展）。
+   - 招聘推广（`career_promo`，宣讲会/双选会/网申推荐/投递邀请等群发）
+   - 对话交流型（`conversation`）、其他（`misc`）
+   - 类型可在 `llm.yaml` 中增删改；Agent 运行期也可用 `create_category` 新建，
+     **新建分类默认不建项**（`create_item=false`），且必须落库校验 id/label（不允许把中文 label 当 id）。
    - 反馈式邮件即使出现“面试/笔试/测评”字样（如“面试体验问卷”“面试结果通知”），
      只要不是预约/安排一次面试笔试测评，就归为通知类，**不会**创建待办。
-3. **待办处理**（事务预约/待办类邮件）：
-   - **自动建待办仅限 面试/笔试/测评 三类，以及含明确截止时间（如“请在24H内完成”“截止9月30日”）的邮件**；
-     通知类/反馈式邮件不再自动创建事项；
+3. **待办处理**（只有“需要本人亲自行动”的邮件才建待办）：
+   - **自动建待办仅限 面试/笔试/测评，以及含明确截止时间/时限的预约、材料提交类邮件**
+     （如“请在24H内完成”“截止9月30日”“链接24小时后失效”）；
+   - **宣讲会/双选会/网申推荐/投递邀请等招聘推广邮件只做通知，永不建待办**（确定性守卫 + Agent 提示词双重约束，
+     Agent 若已误建会立即撤销）；
+   - 通知类/反馈式邮件不建事项；
    - LLM 提取结构化信息：公司/个人、事件（5-10 字）、截止时间 DDL；
    - 截止时间支持三类来源：LLM 提取的 RFC3339、正文人类可读时间自动归一化
      （如 `2026-04-24 11:00(GMT+08:00)` → RFC3339）、相对时限推算（发件/收件时间 + `X小时/日内`）；
-   - 截止 **前一天**（可配置）按配置时刻发送提醒邮件，主题严格为
-     `【类型/{公司,个人}/事件/截止时间月日】`，例如 `【事务预约/待办/字节跳动/技术面试/0910】`；
+     相对时限还会与模型给出的时间做一致性校验，纠正“把 UTC 墙钟当本地时间”的 8 小时偏差；
+   - **同一件事（同公司 + 同类型 + 同一场次）的多封邮件合并为一条待办，以最新邮件为准**；
+     不同场次（截止时间相差 >24h）保留为独立待办；
+   - 提醒策略分级（`remind_policy`）：
+     - 常规（中长期）→ 截止前 `days_before` 天 `lead_time`（默认 09:00）提醒一次；
+     - 紧急（收到时距截止 ≤24h）→ **立即提醒 + 截止前 2 小时**再提醒；
+     - 链接/资格失效类（“链接 N 小时后失效”“有效期 N 天”）→ 立即提醒 + 截止前 2 小时；
+   - 提醒邮件主题严格为 `【类型/{公司,个人}/事件/截止时间月日】`，例如 `【面试/字节跳动/技术面试/0910】`；
    - 可选向 App 推送（通用 HTTP webhook，如 server酱/企业微信机器人）；
    - 回复提醒邮件包含 `【已完成】` / `【不再提醒】`（或英文关键词）→ 事项自动标记完成/静默，不再提醒；
    - 面试/笔试/测评类邮件无明确截止时间时 → 事项标记“待补截止时间”，可在 Web 界面补全。
 4. **检查功能**：每次收到新邮件时 + 每天 `06:00 / 12:30 / 18:30 / 00:00` 检查：
+   - 按提醒策略生成一个或多个提醒时刻（同一事项两次提醒间隔 <30 分钟时只发一封，避免轰炸）；
    - 漏发补偿（应提醒而未发成功 → 立即补发）；
    - 发送失败 → 记录错误并 **延迟 30 分钟重试**；
    - 已完成/静默事项永不提醒。
@@ -60,7 +72,9 @@ cp llm.yaml.example llm.yaml     # 填入 DeepSeek api_key/model
    ```yaml
    listen: "127.0.0.1:8080"
    auth_token: ""            # API 令牌，空 = 不鉴权
-   data_dir: "./data"        # SQLite 数据目录
+   data_dir: "./data"        # 数据目录（日志 + 数据库默认位置）
+   mail_db: ""               # 邮件库路径，空 = data_dir/mail.db
+   todo_db: ""               # 待办库路径，空 = data_dir/todo.db
    timezone: "Asia/Shanghai" # 空 = 系统本地
    poll_interval_secs: 60
    reminder:
@@ -82,20 +96,31 @@ cp llm.yaml.example llm.yaml     # 填入 DeepSeek api_key/model
 > `imap.stu.xmu.edu.cn`），严格校验会握手失败。此时在该端点上加 `tls_insecure: true`
 > （加密通道保留，仅跳过域名校验）。默认 `false` 严格校验。
 
+> **不改动邮箱状态**：收信使用 `UID FETCH (BODY.PEEK[])` 只读拉取，**不会**设置 `\Seen`，
+> 因此程序读过的邮件在你的邮箱/客户端里仍保持未读；也不会删除、移动或改动任何标志位。
+
 ### LLM 配置（`llm.yaml`）
 
 ```yaml
 api_key: "sk-xxx"
 base_url: "https://api.deepseek.com"
-model: "deepseek-chat"      # 或 deepseek-v4-flash 等
+model: "deepseek-chat"      # 或 deepseek-v4-pro 等
 timeout_secs: 60
-categories:                 # 分类类型可增删改
+agent:
+  enabled: true             # tool call 模式（失败自动降级旧固定 prompt 路径）
+  max_tool_rounds: 8
+categories:                 # 分类类型可增删改（首次启动种子）
   - { id: todo,          label: 事务预约/待办, create_item: true }
-  - { id: notification,  label: 通知类,       create_item: true }
+  - { id: interview,     label: 面试,         create_item: true }
+  - { id: assessment,    label: 测评,         create_item: true }
+  - { id: written_test,  label: 笔试,         create_item: true }
+  - { id: notification,  label: 通知类,       create_item: false }
+  - { id: career_promo,  label: 招聘推广,     create_item: false }   # 宣讲会/双选会/网申推荐
   - { id: conversation,  label: 对话交流型,   create_item: false }
   - { id: misc,          label: 其他,         create_item: false }
 ```
-`create_item: true` 的类别会自动建立事务条目（进入待办/通知管理）。
+`create_item: true` 的类别会自动建立待办；Agent 运行期新建的分类**默认 `create_item=false`**
+（需要建项时由 Agent 显式调用 `create_item` 工具）。
 
 > ⚠️ `config` / `config.yaml` / `llm.yaml` 含密钥，已被 `.gitignore` 排除，请勿提交仓库。
 
@@ -210,8 +235,21 @@ mail2/
 ├── scripts/dev.sh     # 本地邮件服务器 / mock LLM / 运行脚本
 ├── config.example     # 邮箱配置模板（YAML 形态）
 ├── llm.yaml.example   # LLM 配置模板
-└── data/              # 运行时生成：mail2.db（SQLite）+ logs/（按天轮转日志文件）
+└── data/              # 运行时生成：mail.db + todo.db + logs/（按天轮转日志）
 ```
+
+### 数据存储：邮件库 / 待办库分离
+
+| 文件 | 内容 | 说明 |
+|---|---|---|
+| `data/mail.db` | `emails`（邮件原文/分类/标注）、`accounts`（收发信账户）、`agent_runs`（LLM 处理轨迹）、`kv`（收信游标、调度标记） | 相当于"邮件语料 + 收信状态"，可从 IMAP 重新拉取 |
+| `data/todo.db` | `items`（待办/事项）、`send_log`（提醒发送记录）、`approvals`（Agent 改删审批）、`categories`（分类全集） | 你真正在意的数据，可单独备份/迁移 |
+
+- 两库之间只保留整数引用（`emails.item_id` ↔ `items.source_email_id`），不做外键约束；
+  待办按"关联邮件收件时间"排序在应用层完成，因此不需要跨库 JOIN。
+- 路径可由 `config.yaml` 的 `mail_db` / `todo_db` 指定（留空 = `data_dir` 下默认文件名）。
+- **旧版单库自动拆分**：首次启动时若发现旧的 `data/mail2.db` 且两个新库都不存在，
+  会按上表把数据分别复制到 `mail.db` / `todo.db`，并把旧文件改名为 `data/mail2.db.bak` 保留（不删除）。
 
 ## 安全说明
 
